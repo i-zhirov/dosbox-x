@@ -164,8 +164,6 @@ void DEBUG_PrintRTC();
 static void DrawCode(void);
 static void DrawInput(void);
 static void DEBUG_RaiseTimerIrq(void);
-static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename);
-static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename);
 static void LogDEVS(void);
 static void LogMCBS(void);
 static void LogGDT(void);
@@ -297,6 +295,9 @@ public:
 };
 #endif
 
+/* The address spaces of the debugger commands. */
+enum EDbgAddressSpace { DBG_SPACE_SEGMENTED, DBG_SPACE_LINEAR, DBG_SPACE_PHYSICAL };
+
 typedef struct MEMFinder {
 	bool usePreviousValue = false;
 	uint8_t opType = 0;
@@ -308,11 +309,43 @@ typedef struct MEMFinder {
 	uint32_t range = 0;
 	uint32_t value = 0;
 	uint32_t matches = 0;
+	EDbgAddressSpace space = DBG_SPACE_SEGMENTED;
 	vector<uint8_t> tableValue;
 	vector<bool> tableTruth;
 }MEMFinder;
 
 MEMFinder* MEMFINDInstance = NULL;
+
+/* Read one value of a memory search instance, in the address space of the
+ * instance. */
+static bool MemFindRead(const MEMFinder &instance,uint32_t address,uint32_t &value)
+{
+	if (instance.space == DBG_SPACE_PHYSICAL) {
+		switch (instance.size) {
+			case 2: value = phys_readw((PhysPt)address); return true;
+			case 4: value = phys_readd((PhysPt)address); return true;
+			default: value = phys_readb((PhysPt)address); return true;
+		}
+	}
+	uint8_t b=0;
+	uint16_t w=0;
+	uint32_t d=0;
+	switch (instance.size) {
+		case 2: if (mem_readw_checked((PhysPt)address,&w)) return false; value = w; return true;
+		case 4: if (mem_readd_checked((PhysPt)address,&d)) return false; value = d; return true;
+		default: if (mem_readb_checked((PhysPt)address,&b)) return false; value = b; return true;
+	}
+}
+
+/* Describe the address of a memory search instance. */
+static const char *MemFindLabel(const MEMFinder &instance,uint64_t offset,char *buffer,size_t length)
+{
+	if (instance.space == DBG_SPACE_SEGMENTED)
+		snprintf(buffer,length,"%04X:%06X",instance.seg,(unsigned)(instance.ofs + offset));
+	else
+		snprintf(buffer,length,"%s%08X",instance.space == DBG_SPACE_PHYSICAL ? "P:" : "L:",(unsigned)(instance.baseLinear + offset));
+	return buffer;
+}
 
 class DEBUG;
 
@@ -630,8 +663,6 @@ enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_CODE_LINEAR, BKPNT_CODE_
 #define BPINT_ALL 0x100
 
 /* The address spaces of the debugger commands. */
-enum EDbgAddressSpace { DBG_SPACE_SEGMENTED, DBG_SPACE_LINEAR, DBG_SPACE_PHYSICAL };
-
 /* An address as the command gives it. */
 struct DbgAddress {
 	EDbgAddressSpace	space;
@@ -654,6 +685,11 @@ struct DbgResolved {
 
 	DbgResolved(void) : valid(false), masked(false), linear(0), physical(0), base(0), limit(0), error("") { }
 };
+
+static DbgResolved ResolveDbgAddress(const DbgAddress &address);
+static const char *DescribeDbgAddress(const DbgAddress &address,char *buffer,size_t length);
+static void SaveMemory(const DbgAddress &address, uint32_t num, const char *filename);
+static void SaveMemoryBin(const DbgAddress &address, uint32_t num, const char *filename);
 
 /* A small condition for a code breakpoint.  The grammar is one or more terms,
  * joined by &&.  A term is a register, an operator, and a hexadecimal value.
@@ -1277,26 +1313,48 @@ void CBreakpoint::ShowList(void)
 	std::list<CBreakpoint*>::iterator i;
 	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint* bp = (*i);
+		DbgAddress address;
+		DbgResolved resolved;
+		switch (bp->GetType()) {
+			case BKPNT_PHYSICAL:
+			case BKPNT_MEMORY:
+			case BKPNT_MEMORY_PROT:
+				address.space = DBG_SPACE_SEGMENTED;
+				address.selector = bp->GetSegment();
+				address.offset = bp->GetOffset();
+				resolved = ResolveDbgAddress(address);
+				break;
+			case BKPNT_CODE_LINEAR:
+			case BKPNT_MEMORY_LINEAR:
+			case BKPNT_MEMORY_FREEZE:
+				address.space = DBG_SPACE_LINEAR;
+				address.selector = 0;
+				address.offset = bp->GetOffset();
+				resolved = ResolveDbgAddress(address);
+				break;
+			default:
+				break;
+		}
 		if (bp->GetType()==BKPNT_PHYSICAL) {
-			DEBUG_ShowMsg("%02X. BP %04X:%04X\n",nr,bp->GetSegment(),bp->GetOffset());
+			DEBUG_ShowMsg("%02X. BP %04X:%04X (linear %08X, physical %08X)\n",nr,bp->GetSegment(),bp->GetOffset(),(unsigned)resolved.linear,(unsigned)resolved.physical);
 		} else if (bp->GetType()==BKPNT_INTERRUPT) {
 			if (bp->GetValue()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X\n",nr,bp->GetIntNr());
 			else if (bp->GetOther()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X\n",nr,bp->GetIntNr(),bp->GetValue());
 			else DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X AL=%02X\n",nr,bp->GetIntNr(),bp->GetValue(),bp->GetOther());
 		} else if (bp->GetType()==BKPNT_MEMORY) {
-			DEBUG_ShowMsg("%02X. BPMEM %04X:%04X (%02X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue());
+			DEBUG_ShowMsg("%02X. BPMEM %04X:%04X (%02X) (linear %08X, physical %08X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue(),(unsigned)resolved.linear,(unsigned)resolved.physical);
 		} else if (bp->GetType()==BKPNT_MEMORY_PROT) {
-			DEBUG_ShowMsg("%02X. BPPM %04X:%08X (%02X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue());
+			DEBUG_ShowMsg("%02X. BPPM %04X:%08X (%02X) (linear %08X, physical %08X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue(),(unsigned)resolved.linear,(unsigned)resolved.physical);
 		} else if (bp->GetType()==BKPNT_CODE_LINEAR) {
 			char cond[128];
 			bp->GetCondition().Describe(cond,sizeof(cond));
-			DEBUG_ShowMsg("%02X. BPX L:%08X%s%s (hits %u)\n",nr,bp->GetOffset(),*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
+			DEBUG_ShowMsg("%02X. BPX L:%08X (physical %08X)%s%s (hits %u)\n",nr,bp->GetOffset(),(unsigned)resolved.physical,*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
 		} else if (bp->GetType()==BKPNT_CODE_SELECTOR) {
 			char cond[128];
 			bp->GetCondition().Describe(cond,sizeof(cond));
-			DEBUG_ShowMsg("%02X. BPX %04X:%08X%s%s (hits %u)\n",nr,bp->GetSegment(),bp->GetOffset(),*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
+			DEBUG_ShowMsg("%02X. BPX %04X:%08X (linear %08X, physical %08X)%s%s (hits %u)\n",nr,bp->GetSegment(),bp->GetOffset(),(unsigned)resolved.linear,(unsigned)resolved.physical,*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
 		} else if (bp->GetType()==BKPNT_MEMORY_LINEAR ) {
-			DEBUG_ShowMsg("%02X. BPLM %08X (%02X)\n",nr,bp->GetOffset(),bp->GetValue());
+			DEBUG_ShowMsg("%02X. BPLM %08X (physical %08X) (%02X)\n",nr,bp->GetOffset(),(unsigned)resolved.physical,bp->GetValue());
         } else if (bp->GetType()==BKPNT_MEMORY_FREEZE ) {
 	        DEBUG_ShowMsg("%02X. FM %08X (%02X)\n",nr,bp->GetOffset(),bp->GetValue());
 		}
@@ -1485,6 +1543,63 @@ static bool ParseBreakpointOptions(char *&p,CDbgCondition &condition,uint32_t &h
 		DEBUG_ShowMsg("DEBUG: unknown breakpoint option %s\n",p);
 		return false;
 	}
+	return true;
+}
+
+/* Describe an address for a command message. */
+static const char *DescribeDbgAddress(const DbgAddress &address,char *buffer,size_t length)
+{
+	if (address.space == DBG_SPACE_SEGMENTED)
+		snprintf(buffer,length,"%04X:%08X",address.selector,(unsigned)address.offset);
+	else
+		snprintf(buffer,length,"%s%08X",address.space == DBG_SPACE_PHYSICAL ? "P:" : "L:",(unsigned)address.offset);
+	return buffer;
+}
+
+/* Read one byte, in the address space of the address. */
+static bool DbgReadByte(const DbgAddress &address,uint64_t index,uint8_t &value)
+{
+	if (address.space == DBG_SPACE_PHYSICAL) {
+		value = phys_readb((PhysPt)(address.offset + index));
+		return true;
+	}
+	if (address.space == DBG_SPACE_LINEAR)
+		return !mem_readb_checked((PhysPt)(address.offset + index),&value);
+	return !mem_readb_checked((PhysPt)GetAddress(address.selector,(uint32_t)(address.offset + index)),&value);
+}
+
+/* Parse an address and a number, for the memory commands.  The legacy form is
+ * the segment, the offset, and the number. */
+static bool ParseDbgAddressAndNumber(char *&p,DbgAddress &address,uint32_t &number)
+{
+	while (*p == ' ') p++;
+	if (((p[0] == 'S' || p[0] == 's' || p[0] == 'L' || p[0] == 'l' || p[0] == 'P' || p[0] == 'p') && p[1] == ':')) {
+		if (!ParseDbgAddress(p,false,address)) return false;
+		while (*p == ' ') p++;
+		char *next = p;
+		bool parsed = true;
+		number = GetHexValue(p,next,&parsed);
+		if (!parsed) return false;
+		p = next;
+		return true;
+	}
+
+	char *next = p;
+	bool parsed = true;
+	uint32_t seg = GetHexValue(p,next,&parsed);
+	if (!parsed) return false;
+	next++;
+	address.space = DBG_SPACE_SEGMENTED;
+	address.selector = (uint16_t)seg;
+	char *next2 = next;
+	address.offset = GetHexValue(next,next2,&parsed);
+	if (!parsed) return false;
+	next2++;
+	while (*next2 == ' ') next2++;
+	char *next3 = next2;
+	number = GetHexValue(next2,next3,&parsed);
+	if (!parsed) return false;
+	p = next3;
 	return true;
 }
 
@@ -2692,20 +2807,44 @@ bool ParseCommand(char* str) {
     }
 
 	if (command == "MEMDUMP") { // Dump memory to file
-		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = GetHexValue(found,found); found++;
-		uint32_t num = GetHexValue(found,found); found++;
+		DbgAddress address;
+		uint32_t num = 0;
+		if (!ParseDbgAddressAndNumber(found,address,num)) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMP needs an address and a length\n");
+			return true;
+		}
 		SkipSpace(found);
-		SaveMemory(seg,ofs,num,*found ? found : "MEMDUMP.TXT");
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMP: %s\n",resolved.error);
+			return true;
+		}
+		char label[32];
+		DEBUG_ShowMsg("DEBUG: Dumping %u bytes at %s (linear %08X, physical %08X)\n",
+			(unsigned)num,DescribeDbgAddress(address,label,sizeof(label)),
+			(unsigned)resolved.linear,(unsigned)resolved.physical);
+		SaveMemory(address,num,*found ? found : "MEMDUMP.TXT");
 		return true;
 	}
 
 	if (command == "MEMDUMPBIN") { // Dump memory to file binary
-		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = GetHexValue(found,found); found++;
-		uint32_t num = GetHexValue(found,found); found++;
+		DbgAddress address;
+		uint32_t num = 0;
+		if (!ParseDbgAddressAndNumber(found,address,num)) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMPBIN needs an address and a length\n");
+			return true;
+		}
 		SkipSpace(found);
-		SaveMemoryBin(seg,ofs,num,*found ? found : "MEMDUMP.BIN");
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMPBIN: %s\n",resolved.error);
+			return true;
+		}
+		char label[32];
+		DEBUG_ShowMsg("DEBUG: Dumping %u bytes at %s (linear %08X, physical %08X)\n",
+			(unsigned)num,DescribeDbgAddress(address,label,sizeof(label)),
+			(unsigned)resolved.linear,(unsigned)resolved.physical);
+		SaveMemoryBin(address,num,*found ? found : "MEMDUMP.BIN");
 		return true;
 	}
 
@@ -2728,32 +2867,18 @@ bool ParseCommand(char* str) {
 				DEBUG_ShowMsg("DEBUG: No active search instances to cancel.");
 			}
 			return true;
-		} else if (found[0] == 'L'){
+		} else if (found[0] == 'L' && found[1] != ':'){
 			if (MEMFINDInstance != NULL){
 				DEBUG_BeginPagedContent();
 				uint32_t j = 0;
 				for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
-							switch (MEMFINDInstance->size){
-								case 1:
-									mem_readb_checked((PhysPt)(i),&valfind8);
-									valfind = valfind8;
-									break;
-								case 2:
-									mem_readw_checked((PhysPt)(i),&valfind16);
-									valfind = valfind16;
-									break;
-								case 4:
-									mem_readd_checked((PhysPt)(i),&valfind32);
-									valfind = valfind32;
-									break;
-								default:
-									mem_readb_checked((PhysPt)(i),&valfind8);
-									valfind = valfind8;
-									break;
-							}
+							valfind = 0;
+							MemFindRead(*MEMFINDInstance,i,valfind);
 							if (MEMFINDInstance->tableTruth[j] == true){
 								listedvalues++;
-								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X (lin %08X) Current Value: %0*X\n",MEMFINDInstance->seg,(MEMFINDInstance->ofs + (i - MEMFINDInstance->baseLinear)),i,MEMFINDInstance->size*2,valfind);
+								char label[32];
+								MemFindLabel(*MEMFINDInstance,i - MEMFINDInstance->baseLinear,label,sizeof(label));
+								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %s (lin %08X) Current Value: %0*X\n",label,i,MEMFINDInstance->size*2,valfind);
 							}
 							j+=MEMFINDInstance->size;
 						}
@@ -2764,14 +2889,37 @@ bool ParseCommand(char* str) {
 			}
 			return true;
 		}
-		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = GetHexValue(found,found); found++;
-		uint32_t num = GetHexValue(found,found); found++;
+		DbgAddress address;
+		uint32_t num = 0;
+		if (!*found) {
+			DEBUG_ShowMsg("DEBUG: --MEMFIND-- Start memory search instance.");
+			DEBUG_ShowMsg("DEBUG: Use MEMS to proceed through search instance.");
+			DEBUG_ShowMsg("DEBUG: Usage: MEMFIND (!/L) [S:|L:|P:]address [range] (B/W/D)");
+			DEBUG_ShowMsg("DEBUG: L - List entries matched in the search instance.");
+			DEBUG_ShowMsg("DEBUG: ! - Cancel memory search instance.");
+			return true;
+		}
+		if (!ParseDbgAddressAndNumber(found,address,num)) {
+			DEBUG_ShowMsg("DEBUG: MEMFIND needs an address and a range\n");
+			return true;
+		}
+		uint16_t seg = address.selector;
+		uint32_t ofs = address.offset;
 		if ((MEMFINDInstance == NULL) && (num > 0)){
-			uint64_t base = GetAddress(seg,ofs);
-			if (base == mem_no_address){
-				DEBUG_ShowMsg("DEBUG: Invalid selector/segment, cancelling.");
-				return true;
+			DbgResolved resolved = ResolveDbgAddress(address);
+			uint64_t base;
+			if (address.space == DBG_SPACE_SEGMENTED) {
+				base = GetAddress(seg,ofs);
+				if (base == mem_no_address){
+					DEBUG_ShowMsg("DEBUG: Invalid selector/segment, cancelling.");
+					return true;
+				}
+			} else {
+				if (!resolved.valid){
+					DEBUG_ShowMsg("DEBUG: MEMFIND: %s\n",resolved.error);
+					return true;
+				}
+				base = address.space == DBG_SPACE_PHYSICAL ? resolved.physical : resolved.linear;
 			}
 			uint64_t memBytes = (uint64_t)MEM_TotalPages() << 12;
 			if ((base + (uint64_t)num) > memBytes){
@@ -2781,12 +2929,9 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg("DEBUG: Created memory search instance.");
 			MEMFINDInstance = new MEMFinder;
 			MEMFINDInstance->baseLinear = (uint32_t)base;
+			MEMFINDInstance->space = address.space;
 		} else if ((MEMFINDInstance == NULL) && (num == 0)){
-			DEBUG_ShowMsg("DEBUG: --MEMFIND-- Start memory search instance.");
-			DEBUG_ShowMsg("DEBUG: Use MEMS to proceed through search instance.");
-			DEBUG_ShowMsg("DEBUG: Usage: MEMFIND (!/L) [seg]:[offset] [range] (B/W/D)");
-			DEBUG_ShowMsg("DEBUG: L - List entries matched in the search instance.");
-			DEBUG_ShowMsg("DEBUG: ! - Cancel memory search instance.");
+			DEBUG_ShowMsg("DEBUG: MEMFIND needs a range above zero\n");
 			return true;
 		} else if (MEMFINDInstance != NULL){
 			DEBUG_ShowMsg("DEBUG: Memory search instance is already active.");
@@ -2810,14 +2955,19 @@ bool ParseCommand(char* str) {
 				MEMFINDInstance->size = 1;
 				break;
 		}
-		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X (lin %08X) with range: %06X\n",seg,ofs,MEMFINDInstance->baseLinear,num);
+		{
+			char label[32];
+			DescribeDbgAddress(address,label,sizeof(label));
+			DEBUG_ShowMsg("DEBUG: RAM search from %s (lin %08X) with range: %06X\n",label,MEMFINDInstance->baseLinear,num);
+		}
 		MEMFINDInstance->range = num;
 		MEMFINDInstance->ofs = ofs;
 		MEMFINDInstance->seg = seg;
 		MEMFINDInstance->tableTruth.resize(num,true);
 		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i++){
-			mem_readb_checked((PhysPt)(i),&valfind8);
-			MEMFINDInstance->tableValue.push_back(valfind8);
+			valfind = 0;
+			MemFindRead(*MEMFINDInstance,i,valfind);
+			MEMFINDInstance->tableValue.push_back((uint8_t)valfind);
 		}
 		return true;
 	}
@@ -2893,35 +3043,10 @@ bool ParseCommand(char* str) {
 		}
 		uint32_t y = 0;	//This index is seperated from the for loop, as the for loop can start from any index while this particular index starts at 0
 		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
-			switch (MEMFINDInstance->size){
-				case 1:
-					mem_readb_checked((PhysPt)(i),&valfind8);
-					valfind = valfind8;
-					if (MEMFINDInstance->usePreviousValue == true){
-						memcpy(&value, &MEMFINDInstance->tableValue[y], 1);
-					}
-					break;
-				case 2:
-					mem_readw_checked((PhysPt)(i),&valfind16);
-					valfind = valfind16;
-					if (MEMFINDInstance->usePreviousValue == true){
-						memcpy(&value, &MEMFINDInstance->tableValue[y], 2);
-					}
-					break;
-				case 4:
-					mem_readd_checked((PhysPt)(i),&valfind32);
-					valfind = valfind32;
-					if (MEMFINDInstance->usePreviousValue == true){
-						memcpy(&value, &MEMFINDInstance->tableValue[y], 4);
-					}
-					break;
-				default:
-					mem_readb_checked((PhysPt)(i),&valfind8);
-					valfind = valfind8;
-					if (MEMFINDInstance->usePreviousValue == true){
-						memcpy(&value, &MEMFINDInstance->tableValue[y], 1);
-					}
-					break;
+			valfind = 0;
+			MemFindRead(*MEMFINDInstance,i,valfind);
+			if (MEMFINDInstance->usePreviousValue == true){
+				memcpy(&value, &MEMFINDInstance->tableValue[y], MEMFINDInstance->size);
 			}
 			switch (MEMFINDInstance->opType){
 				case 1:
@@ -3329,29 +3454,91 @@ bool ParseCommand(char* str) {
 #if C_HEAVY_DEBUG
 
 	if (command == "BPM") { // Add new breakpoint
-		uint16_t seg = (uint16_t)GetHexValue(found,found);found++; // skip ":"
-		uint32_t ofs = GetHexValue(found,found);
-		CBreakpoint::AddMemBreakpoint(seg,ofs);
-		DEBUG_ShowMsg("DEBUG: Set memory breakpoint at %04X:%04X\n",seg,ofs);
+		DbgAddress address;
+		if (!ParseDbgAddress(found,false,address)) {
+			DEBUG_ShowMsg("DEBUG: BPM needs a segment:offset address\n");
+			return true;
+		}
+		if (address.space == DBG_SPACE_PHYSICAL) {
+			DEBUG_ShowMsg("DEBUG: a memory watch needs a selector or a linear address\n");
+			return true;
+		}
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: BPM: %s\n",resolved.error);
+			return true;
+		}
+		if (address.space == DBG_SPACE_LINEAR) {
+			CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(0,address.offset);
+			if (bp) bp->SetType(BKPNT_MEMORY_LINEAR);
+		} else {
+			CBreakpoint::AddMemBreakpoint(address.selector,address.offset);
+		}
+		char label[32];
+		DEBUG_ShowMsg("DEBUG: Set memory breakpoint at %s (linear %08X, physical %08X)%s\n",
+			DescribeDbgAddress(address,label,sizeof(label)),
+			(unsigned)resolved.linear,(unsigned)resolved.physical,
+			resolved.masked ? " [the offset wrapped to 16 bits]" : "");
 		return true;
 	}
 
 	if (command == "BPPM") { // Add new breakpoint
-		uint16_t seg = (uint16_t)GetHexValue(found,found);found++; // skip ":"
-		uint32_t ofs = GetHexValue(found,found);
-		CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(seg,ofs);
-		if (bp)	{
-			bp->SetType(BKPNT_MEMORY_PROT);
-			DEBUG_ShowMsg("DEBUG: Set prot-mode memory breakpoint at %04X:%08X\n",seg,ofs);
+		DbgAddress address;
+		if (!ParseDbgAddress(found,false,address)) {
+			DEBUG_ShowMsg("DEBUG: BPPM needs a segment:offset address\n");
+			return true;
 		}
+		if (address.space == DBG_SPACE_PHYSICAL) {
+			DEBUG_ShowMsg("DEBUG: a memory watch needs a selector or a linear address\n");
+			return true;
+		}
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: BPPM: %s\n",resolved.error);
+			return true;
+		}
+		if (address.space == DBG_SPACE_LINEAR) {
+			CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(0,address.offset);
+			if (bp) bp->SetType(BKPNT_MEMORY_LINEAR);
+		} else {
+			CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(address.selector,address.offset);
+			if (bp) bp->SetType(BKPNT_MEMORY_PROT);
+		}
+		char label[32];
+		DEBUG_ShowMsg("DEBUG: Set prot-mode memory breakpoint at %s (linear %08X, physical %08X)%s\n",
+			DescribeDbgAddress(address,label,sizeof(label)),
+			(unsigned)resolved.linear,(unsigned)resolved.physical,
+			resolved.masked ? " [the offset wrapped to 16 bits]" : "");
 		return true;
 	}
 
 	if (command == "BPLM") { // Add new breakpoint
-		uint32_t ofs = GetHexValue(found,found);
-		CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(0,ofs);
-		if (bp) bp->SetType(BKPNT_MEMORY_LINEAR);
-		DEBUG_ShowMsg("DEBUG: Set linear memory breakpoint at %08X\n",ofs);
+		DbgAddress address;
+		if (!ParseDbgAddress(found,true,address)) {
+			DEBUG_ShowMsg("DEBUG: BPLM needs a linear or a selector address\n");
+			return true;
+		}
+		if (address.space == DBG_SPACE_PHYSICAL) {
+			DEBUG_ShowMsg("DEBUG: a memory watch needs a selector or a linear address\n");
+			return true;
+		}
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: BPLM: %s\n",resolved.error);
+			return true;
+		}
+		if (address.space == DBG_SPACE_LINEAR) {
+			CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(0,address.offset);
+			if (bp) bp->SetType(BKPNT_MEMORY_LINEAR);
+		} else {
+			CBreakpoint* bp = CBreakpoint::AddMemBreakpoint(address.selector,address.offset);
+			if (bp) bp->SetType(BKPNT_MEMORY_PROT);
+		}
+		char label[32];
+		DEBUG_ShowMsg("DEBUG: Set linear memory breakpoint at %s (linear %08X, physical %08X)%s\n",
+			DescribeDbgAddress(address,label,sizeof(label)),
+			(unsigned)resolved.linear,(unsigned)resolved.physical,
+			resolved.masked ? " [the offset wrapped to 16 bits]" : "");
 		return true;
 	}
 
@@ -4833,9 +5020,9 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("VGA cmd                   - VGA related debugging commands.\n");
 		DEBUG_ShowMsg("PC98 cmd                  - PC98 related debugging commands.\n");
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
-		DEBUG_ShowMsg("MEMDUMP [seg]:[off] [len] [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
-		DEBUG_ShowMsg("MEMDUMPBIN [s]:[o] [len] [filename]  - Write memory to a binary file (default: MEMDUMP.BIN).\n");
-        DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
+		DEBUG_ShowMsg("MEMDUMP [S:|L:|P:]addr [len] [file] - Write memory to a text file (default: MEMDUMP.TXT).\n");
+		DEBUG_ShowMsg("MEMDUMPBIN [S:|L:|P:]addr [len] [file] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+        DEBUG_ShowMsg("MEMFIND [S:|L:|P:]addr [range] - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
 
@@ -6794,7 +6981,7 @@ bool CDebugVar::LoadVars(char* name)
 	return true;
 }
 
-static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename) {
+static void SaveMemory(const DbgAddress &address, uint32_t num, const char *filename) {
 	FILE* f = fopen(filename,"wt");
 	if (!f) {
 		DEBUG_ShowMsg("DEBUG: Memory dump failed.\n");
@@ -6803,12 +6990,17 @@ static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *fi
 
 	char buffer[128];
 	char temp[16];
+	char label[32];
+	uint64_t ofs1 = address.offset;
 
 	while (num>16) {
-		sprintf(buffer,"%04X:%04X   ",seg,ofs1);
+		if (address.space == DBG_SPACE_SEGMENTED)
+			sprintf(buffer,"%04X:%04X   ",address.selector,(unsigned)ofs1);
+		else
+			sprintf(buffer,"%s%08X   ",address.space == DBG_SPACE_PHYSICAL ? "P:" : "L:",(unsigned)ofs1);
 		for (uint16_t x=0; x<16; x++) {
 			uint8_t value;
-			if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&value)) sprintf(temp,"%s","?? ");
+			if (!DbgReadByte(address,x,value)) sprintf(temp,"%s","?? ");
 			else sprintf(temp,"%02X ",value);
 			strcat(buffer,temp);
 		}
@@ -6818,34 +7010,40 @@ static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *fi
 		fprintf(f,"%s\n",buffer);
 	}
 	if (num>0) {
-		sprintf(buffer,"%04X:%04X   ",seg,ofs1);
+		if (address.space == DBG_SPACE_SEGMENTED)
+			sprintf(buffer,"%04X:%04X   ",address.selector,(unsigned)ofs1);
+		else
+			sprintf(buffer,"%s%08X   ",address.space == DBG_SPACE_PHYSICAL ? "P:" : "L:",(unsigned)ofs1);
 		for (uint16_t x=0; x<num; x++) {
 			uint8_t value;
-			if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&value)) sprintf(temp,"%s","?? ");
+			if (!DbgReadByte(address,x,value)) sprintf(temp,"%s","?? ");
 			else sprintf(temp,"%02X ",value);
 			strcat(buffer,temp);
 		}
 		fprintf(f,"%s\n",buffer);
 	}
 	fclose(f);
-	DEBUG_ShowMsg("DEBUG: Memory dump success.\n");
+	DescribeDbgAddress(address,label,sizeof(label));
+	DEBUG_ShowMsg("DEBUG: Memory dump of %s for %u bytes success.\n",label,(unsigned)num);
 }
 
-static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename) {
+static void SaveMemoryBin(const DbgAddress &address, uint32_t num, const char *filename) {
 	FILE* f = fopen(filename,"wb");
 	if (!f) {
 		DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
 		return;
 	}
 
+	uint32_t written = 0;
 	for (uint32_t x = 0; x < num;x++) {
 		uint8_t val;
-		if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&val)) val=0;
+		if (!DbgReadByte(address,x,val)) val=0;
 		fwrite(&val,1,1,f);
+		written++;
 	}
 
 	fclose(f);
-	DEBUG_ShowMsg("DEBUG: Memory dump binary success.\n");
+	DEBUG_ShowMsg("DEBUG: Memory dump binary of %u bytes success.\n",(unsigned)written);
 }
 
 static void OutputVecTable(char* filename) {
