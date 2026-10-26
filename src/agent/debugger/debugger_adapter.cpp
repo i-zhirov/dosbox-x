@@ -1,5 +1,6 @@
-#if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
 #include "dosbox.h"
+
+#if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
 #include "agent/debugger_adapter.h"
 #include "agent/agent_bridge.h"
 
