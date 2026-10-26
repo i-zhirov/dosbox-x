@@ -625,9 +625,116 @@ static void AnnotateDirectBranch(char* line, const size_t line_size)
 bool mustCompleteInstruction = false;
 bool skipFirstInstruction = false;
 
-enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
+enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_CODE_LINEAR, BKPNT_CODE_SELECTOR, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
 
 #define BPINT_ALL 0x100
+
+/* The address spaces of the debugger commands. */
+enum EDbgAddressSpace { DBG_SPACE_SEGMENTED, DBG_SPACE_LINEAR, DBG_SPACE_PHYSICAL };
+
+/* An address as the command gives it. */
+struct DbgAddress {
+	EDbgAddressSpace	space;
+	uint16_t			selector;
+	uint32_t			offset;
+
+	DbgAddress(void) : space(DBG_SPACE_SEGMENTED), selector(0), offset(0) { }
+};
+
+/* An address as the resolver reports it.  The command prints the record at set
+ * time, so a wrong address shows itself at once. */
+struct DbgResolved {
+	bool				valid;
+	bool				masked;		/* the offset wrapped to 16 bits */
+	uint64_t			linear;
+	uint64_t			physical;
+	uint32_t			base;
+	uint32_t			limit;
+	const char*			error;
+
+	DbgResolved(void) : valid(false), masked(false), linear(0), physical(0), base(0), limit(0), error("") { }
+};
+
+/* A small condition for a code breakpoint.  The grammar is one or more terms,
+ * joined by &&.  A term is a register, an operator, and a hexadecimal value.
+ * The evaluator reads the register through GetHexValue, so the register set is the
+ * set the debugger already knows. */
+class CDbgCondition
+{
+public:
+	enum { MAX_TERMS = 4, OP_EQ, OP_NE, OP_LT, OP_GT, OP_AND };
+
+	CDbgCondition(void) : count(0) { }
+
+	bool					Add					(const std::string &reg,int op,uint32_t value) {
+		if (count >= MAX_TERMS) return false;
+		terms[count].reg = reg;
+		terms[count].op = op;
+		terms[count].value = value;
+		count++;
+		return true;
+	}
+
+	int						GetCount			(void) const { return count; }
+	const std::string&		GetReg				(int index) const { return terms[index].reg; }
+	int						GetOp				(int index) const { return terms[index].op; }
+	uint32_t				GetValue			(int index) const { return terms[index].value; }
+
+	bool					Evaluate			(void) const;
+	void					Describe			(char *buffer,size_t length) const;
+
+private:
+	struct CTerm {
+		std::string reg;
+		int op;
+		uint32_t value;
+	};
+
+	CTerm					terms[MAX_TERMS];
+	int						count;
+};
+
+bool CDbgCondition::Evaluate(void) const
+{
+	for (int index = 0; index < count; index++) {
+		char buffer[64];
+		snprintf(buffer,sizeof(buffer),"%s",terms[index].reg.c_str());
+		char *next = buffer;
+		bool parsed = true;
+		uint32_t value = GetHexValue(buffer,next,&parsed);
+		if (!parsed) return false;
+		switch (terms[index].op) {
+			case OP_EQ:  if (value != terms[index].value) return false; break;
+			case OP_NE:  if (value == terms[index].value) return false; break;
+			case OP_LT:  if (value >= terms[index].value) return false; break;
+			case OP_GT:  if (value <= terms[index].value) return false; break;
+			case OP_AND: if ((value & terms[index].value) == 0) return false; break;
+			default: return false;
+		}
+	}
+	return true;
+}
+
+void CDbgCondition::Describe(char *buffer,size_t length) const
+{
+	if (length == 0) return;
+	buffer[0] = 0;
+	for (int index = 0; index < count; index++) {
+		const char *op = "==";
+		switch (terms[index].op) {
+			case OP_EQ: op = "=="; break;
+			case OP_NE: op = "!="; break;
+			case OP_LT: op = "<"; break;
+			case OP_GT: op = ">"; break;
+			case OP_AND: op = "&"; break;
+		}
+		char term[64];
+		snprintf(term,sizeof(term),"%s%s%s%08X",index ? " && " : "",terms[index].reg.c_str(),op,terms[index].value);
+		size_t used = strlen(buffer);
+		if (used + 1 >= length) break;
+		strncat(buffer,term,length - used - 1);
+	}
+}
 
 class CBreakpoint
 {
@@ -641,6 +748,10 @@ public:
 	void					SetType			(EBreakpoint _type)			{ type = _type; };
 	void					SetValue		(uint8_t value)				{ ahValue = value; };
 	void					SetOther		(uint8_t other)				{ alValue = other; };	
+	void					SetLinearAddress	(uint32_t linear)			{ location = (PhysPt)linear; offset = linear; segment = 0; type = BKPNT_CODE_LINEAR; };
+	void					SetSelectorAddress	(uint16_t sel, uint32_t off)	{ location = (PhysPt)GetAddress(sel,off); segment = sel; offset = off; type = BKPNT_CODE_SELECTOR; };
+	void					SetCondition		(const CDbgCondition &_condition)	{ condition = _condition; };
+	void					SetHitLimit			(uint32_t limit)			{ hitLimit = limit; };
 
 	bool					IsActive		(void)						{ return active; };
 	void					Activate		(bool _active);
@@ -653,11 +764,18 @@ public:
 	uint8_t					GetIntNr		(void)						{ return intNr; };
 	uint16_t					GetValue		(void)						{ return ahValue; };
 	uint16_t					GetOther		(void)						{ return alValue; };
+	uint32_t				GetHitCount		(void)						{ return hitCount; };
+	uint32_t				GetHitLimit		(void)						{ return hitLimit; };
+	const CDbgCondition&	GetCondition	(void)						{ return condition; };
+	bool					CheckCondition	(void)						{ return condition.Evaluate(); };
+	bool					CheckHitLimit		(void);
 
 	// statics
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
+	static CBreakpoint*		AddCodeBreakpoint	(uint32_t linear, bool once);
+	static CBreakpoint*		AddSelectorBreakpoint(uint16_t sel, uint32_t off, bool once);
 	static void				DeactivateBreakpoints();
 	static void				ActivateBreakpoints	();
 	static void				ActivateBreakpointsExceptAt(PhysPt adr);
@@ -690,6 +808,9 @@ private:
 	// Shared
 	bool		active;
 	bool		once;
+	CDbgCondition	condition;
+	uint32_t	hitLimit;
+	uint32_t	hitCount;
 
 	static std::list<CBreakpoint*>	BPoints;
 	static CBreakpoint*	lastTriggered;
@@ -702,7 +823,15 @@ CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
 #if !C_HEAVY_DEBUG
 oldData(0xCC),
 #endif
-segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false) { }
+segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false),hitLimit(0),hitCount(0) { }
+
+bool CBreakpoint::CheckHitLimit(void)
+{
+	// The hit count counts every match.  A limit of zero means no limit.
+	if (hitLimit > 0 && hitCount >= hitLimit) return false;
+	hitCount++;
+	return true;
+}
 
 void CBreakpoint::Activate(bool _active)
 {
@@ -776,6 +905,24 @@ CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
 	return bp;
 }
 
+CBreakpoint* CBreakpoint::AddCodeBreakpoint(uint32_t linear, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetLinearAddress	(linear);
+	bp->SetOnce			(once);
+	BPoints.push_front		(bp);
+	return bp;
+}
+
+CBreakpoint* CBreakpoint::AddSelectorBreakpoint(uint16_t sel, uint32_t off, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetSelectorAddress	(sel,off);
+	bp->SetOnce			(once);
+	BPoints.push_front		(bp);
+	return bp;
+}
+
 void CBreakpoint::ActivateBreakpoints()
 {
 	// activate all breakpoints
@@ -815,8 +962,18 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 	for (auto i = BPoints.begin(); i != BPoints.end(); ++i) {
 		CBreakpoint *bp = (*i);
 
-		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
-		    (bp->GetLocation() == GetAddress(seg, off))) {
+		bool atAddress = false;
+		if (bp->IsActive()) {
+			if ((bp->GetType() == BKPNT_PHYSICAL) || (bp->GetType() == BKPNT_CODE_LINEAR))
+				atAddress = (bp->GetLocation() == GetAddress(seg, off));
+			else if (bp->GetType() == BKPNT_CODE_SELECTOR)
+				atAddress = (bp->GetSegment() == seg) && (bp->GetOffset() == off);
+		}
+
+		if (atAddress) {
+			// A condition and a hit limit decide whether the stop happens
+			if (!bp->CheckCondition()) continue;
+			if (!bp->CheckHitLimit()) continue;
 			// Found
 			lastTriggered = bp;
 			if (bp->GetOnce()) {
@@ -824,7 +981,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 				(BPoints.erase)(i);
 				bp->Activate(false);
 				delete bp;
-			} else {
+			} else if (bp->GetType() == BKPNT_PHYSICAL) {
 				// Also look for once-only breakpoints at this address
 				bp = FindPhysBreakpoint(seg, off, true);
 				if (bp) {
@@ -1034,6 +1191,14 @@ void CBreakpoint::ShowList(void)
 			DEBUG_ShowMsg("%02X. BPMEM %04X:%04X (%02X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue());
 		} else if (bp->GetType()==BKPNT_MEMORY_PROT) {
 			DEBUG_ShowMsg("%02X. BPPM %04X:%08X (%02X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue());
+		} else if (bp->GetType()==BKPNT_CODE_LINEAR) {
+			char cond[128];
+			bp->GetCondition().Describe(cond,sizeof(cond));
+			DEBUG_ShowMsg("%02X. BPX L:%08X%s%s (hits %u)\n",nr,bp->GetOffset(),*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
+		} else if (bp->GetType()==BKPNT_CODE_SELECTOR) {
+			char cond[128];
+			bp->GetCondition().Describe(cond,sizeof(cond));
+			DEBUG_ShowMsg("%02X. BPX %04X:%08X%s%s (hits %u)\n",nr,bp->GetSegment(),bp->GetOffset(),*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
 		} else if (bp->GetType()==BKPNT_MEMORY_LINEAR ) {
 			DEBUG_ShowMsg("%02X. BPLM %08X (%02X)\n",nr,bp->GetOffset(),bp->GetValue());
         } else if (bp->GetType()==BKPNT_MEMORY_FREEZE ) {
@@ -1041,6 +1206,190 @@ void CBreakpoint::ShowList(void)
 		}
 		nr++;
 	}
+}
+
+/* Parse an address in the S:, L:, and P: forms.  A bare address is a linear
+ * address when bare_is_linear is true, and a selector and an offset otherwise. */
+static bool ParseDbgAddress(char *&p,bool bare_is_linear,DbgAddress &address)
+{
+	while (*p == ' ') p++;
+	if ((p[0] == 'S' || p[0] == 's') && p[1] == ':') {
+		address.space = DBG_SPACE_SEGMENTED;
+		p += 2;
+	} else if ((p[0] == 'L' || p[0] == 'l') && p[1] == ':') {
+		address.space = DBG_SPACE_LINEAR;
+		p += 2;
+	} else if ((p[0] == 'P' || p[0] == 'p') && p[1] == ':') {
+		address.space = DBG_SPACE_PHYSICAL;
+		p += 2;
+	} else {
+		address.space = bare_is_linear ? DBG_SPACE_LINEAR : DBG_SPACE_SEGMENTED;
+	}
+
+	if (address.space == DBG_SPACE_SEGMENTED) {
+		char *next = p;
+		bool parsed = true;
+		uint32_t selector = GetHexValue(p,next,&parsed);
+		if (!parsed) return false;
+		if (*next != ':') return false;
+		next++;
+		address.selector = (uint16_t)selector;
+		char *next2 = next;
+		address.offset = GetHexValue(next,next2,&parsed);
+		if (!parsed) return false;
+		p = next2;
+		return true;
+	}
+
+	char *next = p;
+	bool parsed = true;
+	address.offset = GetHexValue(p,next,&parsed);
+	if (!parsed) return false;
+	p = next;
+	return true;
+}
+
+/* Resolve an address.  The result holds the linear address, the physical
+ * address, the descriptor base, the limit, and the wrap flag.  The resolver
+ * reports a wrap and never masks in silence. */
+static DbgResolved ResolveDbgAddress(const DbgAddress &address)
+{
+	DbgResolved result;
+
+	if (address.space == DBG_SPACE_PHYSICAL) {
+		result.valid = true;
+		result.physical = address.offset;
+		return result;
+	}
+	if (address.space == DBG_SPACE_LINEAR) {
+		result.valid = true;
+		result.linear = address.offset;
+		result.physical = PAGING_GetPhysicalAddress((LinearPt)address.offset);
+		return result;
+	}
+
+	uint16_t seg = address.selector;
+	uint32_t off = address.offset;
+
+	if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+		Descriptor desc;
+		bool found = false;
+		if (seg & 4) {
+			/* The LDT descriptors live in the table the GDT points at. */
+			Descriptor ldtDesc;
+			if (!cpu.gdt.GetDescriptor(cpu.gdt.SLDT(),ldtDesc)) {
+				result.error = "the LDT does not resolve";
+				return result;
+			}
+			uint32_t index = (seg >> 3) & 0x1FFFu;
+			if ((index << 3) >= ldtDesc.GetLimit()) {
+				result.error = "the LDT index is above the LDT limit";
+				return result;
+			}
+			desc.Load((PhysPt)(ldtDesc.GetBase() + (index << 3)));
+			found = true;
+		} else {
+			found = cpu.gdt.GetDescriptor(seg,desc);
+		}
+		if (!found || desc.GetLimit() == 0) {
+			result.error = "the selector does not resolve";
+			return result;
+		}
+		if (!desc.saved.seg.big && off > 0xFFFFu) { off &= 0xFFFFu; result.masked = true; }
+		if (off > desc.GetLimit()) {
+			result.error = "the offset is above the descriptor limit";
+			return result;
+		}
+		result.base = desc.GetBase();
+		result.limit = desc.GetLimit();
+		result.linear = (uint64_t)result.base + off;
+		result.physical = PAGING_GetPhysicalAddress((LinearPt)result.linear);
+		result.valid = true;
+		return result;
+	}
+
+	/* Real mode and V86.  The segment base is the segment shifted left. */
+	if (off > 0xFFFFu) { off &= 0xFFFFu; result.masked = true; }
+	result.base = (uint32_t)seg << 4u;
+	result.linear = ((uint64_t)seg << 4u) + off;
+	result.physical = PAGING_GetPhysicalAddress((LinearPt)result.linear);
+	result.valid = true;
+	return result;
+}
+
+/* Parse the optional IF, HIT, and ONCE options of a code breakpoint. */
+static bool ParseBreakpointOptions(char *&p,CDbgCondition &condition,uint32_t &hitLimit,bool &once)
+{
+	while (*p) {
+		while (*p == ' ') p++;
+		if (!*p) break;
+
+		if (!strncmp(p,"IF",2) && (p[2] == ' ' || p[2] == 0)) {
+			p += 2;
+			while (true) {
+				while (*p == ' ') p++;
+				const char *start = p;
+				while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+				if (p == start) {
+					DEBUG_ShowMsg("DEBUG: the condition needs a register\n");
+					return false;
+				}
+				std::string reg(start,(size_t)(p-start));
+				while (*p == ' ') p++;
+				int op;
+				if (!strncmp(p,"==",2)) { op = CDbgCondition::OP_EQ; p += 2; }
+				else if (!strncmp(p,"!=",2)) { op = CDbgCondition::OP_NE; p += 2; }
+				else if (*p == '<') { op = CDbgCondition::OP_LT; p++; }
+				else if (*p == '>') { op = CDbgCondition::OP_GT; p++; }
+				else if (*p == '&') { op = CDbgCondition::OP_AND; p++; }
+				else {
+					DEBUG_ShowMsg("DEBUG: the condition needs an operator\n");
+					return false;
+				}
+				while (*p == ' ') p++;
+				char *next = p;
+				bool parsed = true;
+				uint32_t value = GetHexValue(p,next,&parsed);
+				if (!parsed) {
+					DEBUG_ShowMsg("DEBUG: the condition needs a value\n");
+					return false;
+				}
+				p = next;
+				if (!condition.Add(reg,op,value)) {
+					DEBUG_ShowMsg("DEBUG: the condition holds too many terms\n");
+					return false;
+				}
+				while (*p == ' ') p++;
+				if (!strncmp(p,"&&",2)) { p += 2; continue; }
+				break;
+			}
+			continue;
+		}
+
+		if (!strncmp(p,"HIT",3) && (p[3] == ' ' || p[3] == 0)) {
+			p += 3;
+			while (*p == ' ') p++;
+			char *next = p;
+			bool parsed = true;
+			hitLimit = GetHexValue(p,next,&parsed);
+			if (!parsed) {
+				DEBUG_ShowMsg("DEBUG: HIT needs a value\n");
+				return false;
+			}
+			p = next;
+			continue;
+		}
+
+		if (!strncmp(p,"ONCE",4) && (p[4] == ' ' || p[4] == 0)) {
+			once = true;
+			p += 4;
+			continue;
+		}
+
+		DEBUG_ShowMsg("DEBUG: unknown breakpoint option %s\n",p);
+		return false;
+	}
+	return true;
 }
 
 bool DEBUG_Breakpoint(void)
@@ -2770,12 +3119,74 @@ bool ParseCommand(char* str) {
 	}
 
 	if (command == "BP") { // Add new breakpoint
-		uint16_t seg = (uint16_t)GetHexValue(found,found);found++; // skip ":"
-		uint32_t ofs = GetHexValue(found,found);
-		CBreakpoint::AddBreakpoint(seg,ofs,false);
-		DEBUG_ShowMsg("DEBUG: Set breakpoint at %04X:%04X\n",seg,ofs);
+		DbgAddress address;
+		if (!ParseDbgAddress(found,false,address)) {
+			DEBUG_ShowMsg("DEBUG: BP needs a segment:offset address\n");
+			return true;
+		}
+		if (address.space == DBG_SPACE_PHYSICAL) {
+			DEBUG_ShowMsg("DEBUG: a code breakpoint needs a selector or a linear address\n");
+			return true;
+		}
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: BP: %s\n",resolved.error);
+			return true;
+		}
+		if (address.space == DBG_SPACE_LINEAR) {
+			CBreakpoint::AddCodeBreakpoint(address.offset,false);
+#if !C_HEAVY_DEBUG
+			DEBUG_ShowMsg("DEBUG: note: a linear code breakpoint needs the heavy debug build\n");
+#endif
+			DEBUG_ShowMsg("DEBUG: Set breakpoint at L:%08X (physical %08X)%s\n",address.offset,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+		} else {
+			CBreakpoint::AddBreakpoint(address.selector,address.offset,false);
+			DEBUG_ShowMsg("DEBUG: Set breakpoint at %04X:%08X (linear %08X, physical %08X)%s\n",address.selector,address.offset,(uint32_t)resolved.linear,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+		}
 		return true;
 	}
+
+#if C_HEAVY_DEBUG
+
+	if (command == "BPX") { // Add a linear or a selector code breakpoint
+		DbgAddress address;
+		if (!ParseDbgAddress(found,true,address)) {
+			DEBUG_ShowMsg("DEBUG: BPX needs a linear or a selector address\n");
+			return true;
+		}
+		CDbgCondition condition;
+		uint32_t hitLimit = 0;
+		bool once = false;
+		if (!ParseBreakpointOptions(found,condition,hitLimit,once)) return true;
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: BPX: %s\n",resolved.error);
+			return true;
+		}
+		CBreakpoint *bp = nullptr;
+		if (address.space == DBG_SPACE_LINEAR) {
+			bp = CBreakpoint::AddCodeBreakpoint(address.offset,once);
+			DEBUG_ShowMsg("DEBUG: Set linear code breakpoint at L:%08X (physical %08X)%s\n",address.offset,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+		} else if (address.space == DBG_SPACE_SEGMENTED) {
+			bp = CBreakpoint::AddSelectorBreakpoint(address.selector,address.offset,once);
+			DEBUG_ShowMsg("DEBUG: Set selector code breakpoint at %04X:%08X (linear %08X, physical %08X)%s\n",address.selector,address.offset,(uint32_t)resolved.linear,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+		} else {
+			DEBUG_ShowMsg("DEBUG: BPX takes a linear or a selector address\n");
+			return true;
+		}
+		if (bp) {
+			bp->SetCondition(condition);
+			bp->SetHitLimit(hitLimit);
+			if (condition.GetCount() > 0) {
+				char cond[128];
+				condition.Describe(cond,sizeof(cond));
+				DEBUG_ShowMsg("DEBUG: the condition is %s\n",cond);
+			}
+		}
+		return true;
+	}
+
+#endif
 
 #if C_HEAVY_DEBUG
 
@@ -4246,7 +4657,10 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("BPM    [segment]:[offset] - Set memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPPM   [selector]:[offset]- Set pmode-memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPLM   [linear address]   - Set linear memory breakpoint (memory change).\n");
+		DEBUG_ShowMsg("BPX    [L:|S:]address [IF reg op value] [HIT n] [ONCE]\n");
+		DEBUG_ShowMsg("                          - Set code breakpoint (no byte patch).\n");
 #endif
+		DEBUG_ShowMsg("S:     selector and offset, L: linear, P: physical\n");
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
 		DEBUG_ShowMsg("C / D  [segment]:[offset] - Set code / data view address.\n");

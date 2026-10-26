@@ -159,6 +159,8 @@ guest -> CPU and memory -> debugger core -> channels -> client
 - The test names the behavior it pins, and it holds one behavior.
 - A debugger command test drives the command through the debugger, and it checks
   the result, not the implementation.
+- A debugger feature that needs the running emulator is tested by a session script
+  in the project's `tools/scripts/`, and the commit body names the script.
 - A patch without a test does not merge.
 - The fork records the command and the output in the commit message body.
 
