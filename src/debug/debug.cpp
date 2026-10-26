@@ -1091,19 +1091,22 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 			if ((bp->GetType()==BKPNT_MEMORY) || (bp->GetType()==BKPNT_MEMORY_PROT) || (bp->GetType()==BKPNT_MEMORY_LINEAR) || (bp->GetType()==BKPNT_MEMORY_FREEZE)) {
 				// Watch Protected Mode Memoryonly in pmode
 				if (bp->GetType()==BKPNT_MEMORY_PROT) {
-					// Check if pmode is active
-					if (!cpu.pmode) return false;
+					// Check if pmode is active.  Skip this entry and keep the scan,
+					// or a watch in real mode hides every later breakpoint.
+					if (!cpu.pmode) continue;
 					// Check if descriptor is valid
 					Descriptor desc;
-					if (!cpu.gdt.GetDescriptor(bp->GetSegment(),desc)) return false;
-					if (desc.GetLimit()==0) return false;
+					if (!cpu.gdt.GetDescriptor(bp->GetSegment(),desc)) continue;
+					if (desc.GetLimit()==0) continue;
 				}
 
 				Bitu address; 
 				if (bp->GetType()==BKPNT_MEMORY_LINEAR) address = bp->GetOffset();
 				else address = (Bitu)GetAddress(bp->GetSegment(),bp->GetOffset());
 				uint8_t value=0;
-				if (mem_readb_checked((PhysPt)address,&value)) return false;
+				// Skip this entry when the address is not readable, and keep
+				// the scan for the other breakpoints.
+				if (mem_readb_checked((PhysPt)address,&value)) continue;
 				if (bp->GetValue() != value) {
 					// Yup, memory value changed
                     if (bp->GetType()==BKPNT_MEMORY_FREEZE){
