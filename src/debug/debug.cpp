@@ -819,6 +819,99 @@ private:
 #endif
 };
 
+/* A byte patch.  PATCHB records the original byte, writes the new byte, and
+ * restores the original byte at the stop, so the patched instruction runs and the
+ * guest frame stays correct.  The patch is written again on the resume. */
+class CDbgPatch
+{
+public:
+	static bool				Add				(uint64_t linear,uint8_t newByte,uint8_t &oldByte);
+	static bool				DisarmAt		(uint64_t linear);
+	static void				Activate		(void);
+	static void				ShowList		(void);
+
+private:
+	struct CRecord {
+		uint64_t	linear;
+		PhysPt		physical;
+		uint8_t		oldByte;
+		uint8_t		newByte;
+		bool		armed;
+	};
+
+	static std::list<CRecord>	Patches;
+};
+
+std::list<CDbgPatch::CRecord> CDbgPatch::Patches;
+
+bool CDbgPatch::Add(uint64_t linear,uint8_t newByte,uint8_t &oldByte)
+{
+	/* mem_readb and mem_writeb take a linear address.  The physical address
+	 * is only for the report. */
+	uint8_t old = mem_readb((PhysPt)linear);
+	PhysPt physical = PAGING_GetPhysicalAddress((LinearPt)linear);
+
+	/* A second patch at the same address replaces the first. */
+	for (std::list<CRecord>::iterator i=Patches.begin(); i!=Patches.end(); ++i) {
+		if (i->linear == linear) {
+			if (i->armed) mem_writeb((PhysPt)i->linear,i->oldByte);
+			i->physical = physical;
+			i->oldByte = old;
+			i->newByte = newByte;
+			i->armed = true;
+			mem_writeb((PhysPt)i->linear,i->newByte);
+			oldByte = old;
+			return true;
+		}
+	}
+
+	CRecord record;
+	record.linear = linear;
+	record.physical = physical;
+	record.oldByte = old;
+	record.newByte = newByte;
+	record.armed = true;
+	Patches.push_back(record);
+	mem_writeb((PhysPt)record.linear,record.newByte);
+	oldByte = old;
+	return true;
+}
+
+bool CDbgPatch::DisarmAt(uint64_t linear)
+{
+	for (std::list<CRecord>::iterator i=Patches.begin(); i!=Patches.end(); ++i) {
+		if (i->linear == linear && i->armed) {
+			/* Restore the original byte, so the guest instruction runs. */
+			mem_writeb((PhysPt)i->linear,i->oldByte);
+			i->armed = false;
+			return true;
+		}
+	}
+	return false;
+}
+
+void CDbgPatch::Activate(void)
+{
+	for (std::list<CRecord>::iterator i=Patches.begin(); i!=Patches.end(); ++i) {
+		if (!i->armed) {
+			/* The address can move with the page tables, so resolve it again. */
+			i->physical = PAGING_GetPhysicalAddress((LinearPt)i->linear);
+			mem_writeb((PhysPt)i->linear,i->newByte);
+			i->armed = true;
+		}
+	}
+}
+
+void CDbgPatch::ShowList(void)
+{
+	int nr = 0;
+	for (std::list<CRecord>::iterator i=Patches.begin(); i!=Patches.end(); ++i) {
+		DEBUG_ShowMsg("%02X. PATCHB L:%08X %02X -> %02X%s\n",nr,
+			(unsigned)i->linear,i->oldByte,i->newByte,i->armed ? "" : " (disarmed)");
+		nr++;
+	}
+}
+
 CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
 #if !C_HEAVY_DEBUG
 oldData(0xCC),
@@ -1410,6 +1503,11 @@ bool DEBUG_IntBreakpoint(uint8_t intNum)
 	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	if (!CBreakpoint::CheckIntBreakpoint(where,intNum,reg_ah,reg_al)) return false;
 	// Found. Breakpoint is valid
+	if (intNum == 3) {
+		/* Restore a patched byte before the guest instruction runs, so the
+		 * patched instruction executes and the guest frame stays correct. */
+		CDbgPatch::DisarmAt(where);
+	}
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
 	return true;
 }
@@ -3146,6 +3244,43 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "PATCHB") { // Patch a byte and restore it at the stop
+		if (found[0] == 0) {
+			DEBUG_BeginPagedContent();
+			DEBUG_ShowMsg("Byte patches:\n");
+			DEBUG_ShowMsg("-------------------------------------------------------------------------\n");
+			CDbgPatch::ShowList();
+			DEBUG_EndPagedContent();
+			return true;
+		}
+		DbgAddress address;
+		if (!ParseDbgAddress(found,true,address)) {
+			DEBUG_ShowMsg("DEBUG: PATCHB needs a linear address\n");
+			return true;
+		}
+		if (address.space != DBG_SPACE_LINEAR) {
+			DEBUG_ShowMsg("DEBUG: PATCHB needs a linear address\n");
+			return true;
+		}
+		while (*found == ' ') found++;
+		char *next = found;
+		bool parsed = true;
+		uint32_t value = GetHexValue(found,next,&parsed);
+		if (!parsed || value > 0xFFu) {
+			DEBUG_ShowMsg("DEBUG: PATCHB needs a byte value\n");
+			return true;
+		}
+		DbgResolved resolved = ResolveDbgAddress(address);
+		if (!resolved.valid) {
+			DEBUG_ShowMsg("DEBUG: PATCHB: %s\n",resolved.error);
+			return true;
+		}
+		uint8_t oldByte = 0;
+		CDbgPatch::Add(resolved.linear,(uint8_t)value,oldByte);
+		DEBUG_ShowMsg("DEBUG: Patched L:%08X at the physical %08X: %02X -> %02X\n",(unsigned)resolved.linear,(unsigned)resolved.physical,oldByte,(uint8_t)value);
+		return true;
+	}
+
 #if C_HEAVY_DEBUG
 
 	if (command == "BPX") { // Add a linear or a selector code breakpoint
@@ -4660,6 +4795,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("BPX    [L:|S:]address [IF reg op value] [HIT n] [ONCE]\n");
 		DEBUG_ShowMsg("                          - Set code breakpoint (no byte patch).\n");
 #endif
+		DEBUG_ShowMsg("PATCHB L:<addr> <byte>   - Patch a byte and restore it at the stop.\n");
 		DEBUG_ShowMsg("S:     selector and offset, L: linear, P: physical\n");
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
@@ -5040,6 +5176,8 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 	else {
 		// ensure all breakpoints are activated
 		CBreakpoint::ActivateBreakpoints();
+		// write the byte patches again
+		CDbgPatch::Activate();
 		DOSBOX_SetNormalLoop();
 	}
 	return ret;
