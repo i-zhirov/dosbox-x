@@ -81,6 +81,15 @@ bool DEBUG_AgentFileIoRead(uint64_t cursor, bool has_cursor, uint32_t limit,
                             std::vector<DEBUG_AgentFileIoRecord>* records,
                             bool* has_next, uint64_t* next_cursor);
 bool DEBUG_AgentFileIoStop(uint64_t* records);
+bool DEBUG_AgentKeyText(const char* text,uint32_t* injected);
+bool DEBUG_AgentKeyScan(uint32_t scan,uint32_t* injected);
+bool DEBUG_AgentKeyScript(const char* filename,uint32_t* lines);
+bool DEBUG_AgentKeyStop();
+bool DEBUG_AgentInputStop();
+bool DEBUG_AgentMouseMove(int x,int y);
+bool DEBUG_AgentMouseButton(uint8_t button,bool down);
+bool DEBUG_AgentMouseClick(uint8_t button);
+void DEBUG_InputRunTimers();
 
 // The file-I/O record used by the DOS file calls.
 class CDbgFileIo {

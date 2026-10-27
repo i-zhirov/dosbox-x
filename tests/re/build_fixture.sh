@@ -5,4 +5,5 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 nasm -f bin -o "$DIR/fixture/re_loop.com" "$DIR/fixture/re_loop.asm"
 nasm -f bin -o "$DIR/fixture/re_fixture.com" "$DIR/fixture/re_fixture.asm"
 nasm -f bin -o "$DIR/fixture/re_fileio.com" "$DIR/fixture/re_fileio.asm"
+nasm -f bin -o "$DIR/fixture/re_input.com" "$DIR/fixture/re_input.asm"
 ls -la "$DIR/fixture/"*.com

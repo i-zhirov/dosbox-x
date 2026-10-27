@@ -39,6 +39,7 @@ using namespace std;
 #include "fpu_state.h"
 #include "logging.h"
 #include "bios.h"
+#include "mouse.h"
 #include "timer.h"
 #include "video.h"
 #include "vga.h"
@@ -2093,6 +2094,190 @@ bool DEBUG_AgentSetRegisters(const DEBUG_AgentRegisterValues* registers)
 	return true;
 }
 
+/* The key and mouse injectors.  KEY pushes a key into the BIOS key buffer and
+ * MOUSE drives the mouse state.  KEY SCRIPT and MOUSE CLICK queue timed events,
+ * and the heavy-mode hook runs them while the guest executes. */
+
+#define DEBUG_INPUT_EVENT_KEY_TEXT	0
+#define DEBUG_INPUT_EVENT_KEY_SCAN	1
+#define DEBUG_INPUT_EVENT_MOUSE_BUTTON	2
+#define DEBUG_INPUT_EVENT_MOUSE_MOVE	3
+
+struct DEBUG_InputEvent {
+	double time;
+	int type;
+	std::string text;
+	uint32_t value;
+	uint32_t value2;
+	bool down;
+};
+
+static std::vector<DEBUG_InputEvent> input_events;
+
+static uint8_t DEBUG_AsciiScanCode(unsigned char c)
+{
+	/* The BIOS key code holds the scan code in the high byte and the ASCII
+	 * code in the low byte.  The table holds the unshifted scan code for the
+	 * ASCII range 0x20 to 0x7f. */
+	static const char scan_table[] =
+		"\x39"
+		"\x02\x28\x04\x05\x06\x08\x28\x0A\x0B\x09\x0D\x33\x0C\x34\x35"
+		"\x0B\x02\x03\x04\x05\x06\x07\x08\x09\x0A"
+		"\x27\x27\x33\x0D\x34\x35\x03"
+		"\x1E\x30\x2E\x20\x12\x21\x22\x23\x17\x24\x25\x26\x32\x31\x18\x19\x10\x13\x1F\x14\x16\x2F\x11\x2D\x15\x2C"
+		"\x1A\x2B\x1B\x07\x0C\x29"
+		"\x1E\x30\x2E\x20\x12\x21\x22\x23\x17\x24\x25\x26\x32\x31\x18\x19\x10\x13\x1F\x14\x16\x2F\x11\x2D\x15\x2C"
+		"\x1A\x2B\x1B\x07\x0C\x29\x53";
+	if (c == '\r' || c == '\n') return 0x1C;
+	if (c == 0x08) return 0x0E;
+	if (c == 0x09) return 0x0F;
+	if (c == 0x1B) return 0x01;
+	if (c < 0x20 || c > 0x7F) return 0;
+	return (uint8_t)scan_table[c - 0x20];
+}
+
+bool DEBUG_AgentKeyText(const char* text,uint32_t* injected)
+{
+	if (text == NULL) return false;
+	uint32_t count = 0;
+	for (const char* p = text; *p != 0; p++) {
+		const uint8_t scan = DEBUG_AsciiScanCode((unsigned char)*p);
+		BIOS_AddKeyToBuffer((uint16_t)(((uint16_t)scan << 8) | (unsigned char)*p));
+		count++;
+	}
+	if (injected != NULL) *injected = count;
+	return true;
+}
+
+bool DEBUG_AgentKeyScan(uint32_t scan,uint32_t* injected)
+{
+	if (scan > 0xFF) return false;
+	BIOS_AddKeyToBuffer((uint16_t)((scan & 0xFF) << 8));
+	if (injected != NULL) *injected = 1;
+	return true;
+}
+
+static void DEBUG_QueueInputEvent(const DEBUG_InputEvent& event)
+{
+	size_t index = 0;
+	while (index < input_events.size() && input_events[index].time <= event.time) index++;
+	input_events.insert(input_events.begin() + index,event);
+}
+
+static void DEBUG_RunInputEvent(const DEBUG_InputEvent& event)
+{
+	uint32_t injected = 0;
+	switch (event.type) {
+	case DEBUG_INPUT_EVENT_KEY_TEXT:
+		DEBUG_AgentKeyText(event.text.c_str(),&injected);
+		break;
+	case DEBUG_INPUT_EVENT_KEY_SCAN:
+		DEBUG_AgentKeyScan(event.value,&injected);
+		break;
+	case DEBUG_INPUT_EVENT_MOUSE_MOVE:
+		Mouse_InjectMove((int)event.value,(int)event.value2);
+		break;
+	case DEBUG_INPUT_EVENT_MOUSE_BUTTON:
+		if (event.down) Mouse_ButtonPressed((uint8_t)event.value);
+		else Mouse_ButtonReleased((uint8_t)event.value);
+		break;
+	}
+}
+
+void DEBUG_InputRunTimers()
+{
+	if (input_events.empty()) return;
+	const double now = PIC_FullIndex();
+	while (!input_events.empty() && now >= input_events.front().time) {
+		const DEBUG_InputEvent event = input_events.front();
+		input_events.erase(input_events.begin());
+		DEBUG_RunInputEvent(event);
+	}
+}
+
+bool DEBUG_AgentKeyScript(const char* filename,uint32_t* lines)
+{
+	if (filename == NULL) return false;
+	FILE* file = fopen(filename,"rb");
+	if (file == NULL) return false;
+	input_events.clear();
+	const double at = PIC_FullIndex();
+	uint32_t count = 0;
+	char buffer[512];
+	while (fgets(buffer,sizeof(buffer),file) != NULL) {
+		size_t length = strlen(buffer);
+		while (length > 0 && (buffer[length-1] == '\n' || buffer[length-1] == '\r')) buffer[--length] = 0;
+		if (length == 0 || buffer[0] == '#') continue;
+		char* rest = NULL;
+		const double delay = strtod(buffer,&rest);
+		if (rest == buffer || rest == NULL) { fclose(file); return false; }
+		while (*rest == ' ' || *rest == '\t') rest++;
+		if (*rest == 0) { fclose(file); return false; }
+		DEBUG_InputEvent event;
+		event.time = at + delay;
+		event.value = 0;
+		event.value2 = 0;
+		event.down = false;
+		if (!strncmp(rest,"SCAN:",5)) {
+			event.type = DEBUG_INPUT_EVENT_KEY_SCAN;
+			event.value = (uint32_t)strtoul(rest + 5,NULL,0);
+		} else {
+			event.type = DEBUG_INPUT_EVENT_KEY_TEXT;
+			event.text = rest;
+		}
+		DEBUG_QueueInputEvent(event);
+		count++;
+	}
+	fclose(file);
+	if (lines != NULL) *lines = count;
+	return true;
+}
+
+bool DEBUG_AgentKeyStop()
+{
+	input_events.clear();
+	return true;
+}
+
+bool DEBUG_AgentInputStop()
+{
+	input_events.clear();
+	for (uint8_t button = 1; button <= 3; button++) Mouse_ButtonReleased((uint8_t)(button - 1));
+	return true;
+}
+
+bool DEBUG_AgentMouseMove(int x,int y)
+{
+	Mouse_InjectMove(x,y);
+	return true;
+}
+
+bool DEBUG_AgentMouseButton(uint8_t button,bool down)
+{
+	if (button < 1 || button > 3) return false;
+	if (down) Mouse_ButtonPressed((uint8_t)(button - 1));
+	else Mouse_ButtonReleased((uint8_t)(button - 1));
+	return true;
+}
+
+bool DEBUG_AgentMouseClick(uint8_t button)
+{
+	if (button < 1 || button > 3) return false;
+	const double now = PIC_FullIndex();
+	DEBUG_InputEvent press;
+	press.time = now;
+	press.type = DEBUG_INPUT_EVENT_MOUSE_BUTTON;
+	press.value = button;
+	press.value2 = 0;
+	press.down = true;
+	DEBUG_QueueInputEvent(press);
+	DEBUG_InputEvent release = press;
+	release.time = now + 100.0;
+	release.down = false;
+	DEBUG_QueueInputEvent(release);
+	return true;
+}
+
 bool DEBUG_AgentCoverageStart(uint64_t start, uint64_t length)
 {
 	return CDbgCoverage::Start(start,length);
@@ -3807,6 +3992,92 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg("DEBUG: %s\n",CDbgFileIo::Status().c_str());
 		} else {
 			DEBUG_ShowMsg("DEBUG: FILEIO START <file> | STOP | STATUS\n");
+		}
+		return true;
+	}
+
+	if (command == "KEY") {
+		while (*found == ' ') found++;
+		if (!strncmp(found,"SCAN",4)) {
+			found += 4;
+			while (*found == ' ') found++;
+			char* end = NULL;
+			const unsigned long code = strtoul(found,&end,0);
+			if (found == end || *end != 0 || code > 0xff) {
+				DEBUG_ShowMsg("DEBUG: KEY SCAN needs a scan code\n");
+				return true;
+			}
+			uint32_t injected = 0;
+			DEBUG_AgentKeyScan((uint32_t)code,&injected);
+			DEBUG_ShowMsg("DEBUG: KEY SCAN %02X injected\n",(unsigned)code);
+		} else if (!strncmp(found,"SCRIPT",6)) {
+			found += 6;
+			while (*found == ' ') found++;
+			if (!*found) {
+				DEBUG_ShowMsg("DEBUG: KEY SCRIPT needs a file name\n");
+				return true;
+			}
+			uint32_t lines = 0;
+			if (!DEBUG_AgentKeyScript(found,&lines)) {
+				DEBUG_ShowMsg("DEBUG: KEY SCRIPT failed\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: KEY SCRIPT queued %u line(s)\n",lines);
+		} else if (!strncmp(found,"STOP",4)) {
+			DEBUG_AgentKeyStop();
+			DEBUG_ShowMsg("DEBUG: key injection stopped\n");
+		} else if (*found == 0) {
+			DEBUG_ShowMsg("DEBUG: KEY <text> | SCAN <code> | SCRIPT <file> | STOP\n");
+		} else {
+			uint32_t injected = 0;
+			DEBUG_AgentKeyText(found,&injected);
+			DEBUG_ShowMsg("DEBUG: KEY injected %u key(s)\n",injected);
+		}
+		return true;
+	}
+
+	if (command == "MOUSE") {
+		while (*found == ' ') found++;
+		if (!strncmp(found,"MOVE",4)) {
+			found += 4;
+			int x = 0, y = 0;
+			if (sscanf(found,"%d %d",&x,&y) != 2) {
+				DEBUG_ShowMsg("DEBUG: MOUSE MOVE needs an x and a y\n");
+				return true;
+			}
+			DEBUG_AgentMouseMove(x,y);
+			DEBUG_ShowMsg("DEBUG: MOUSE MOVE %d %d\n",x,y);
+		} else if (!strncmp(found,"BUTTON",6)) {
+			found += 6;
+			int button = 0;
+			char direction[8] = {0};
+			if (sscanf(found,"%d %7s",&button,direction) != 2 || button < 1 || button > 3) {
+				DEBUG_ShowMsg("DEBUG: MOUSE BUTTON <n> DOWN|UP\n");
+				return true;
+			}
+			if (!strcasecmp(direction,"DOWN")) {
+				DEBUG_AgentMouseButton((uint8_t)button,true);
+				DEBUG_ShowMsg("DEBUG: MOUSE BUTTON %d DOWN\n",button);
+			} else if (!strcasecmp(direction,"UP")) {
+				DEBUG_AgentMouseButton((uint8_t)button,false);
+				DEBUG_ShowMsg("DEBUG: MOUSE BUTTON %d UP\n",button);
+			} else {
+				DEBUG_ShowMsg("DEBUG: MOUSE BUTTON <n> DOWN|UP\n");
+			}
+		} else if (!strncmp(found,"CLICK",5)) {
+			found += 5;
+			int button = 0;
+			if (sscanf(found,"%d",&button) != 1 || button < 1 || button > 3) {
+				DEBUG_ShowMsg("DEBUG: MOUSE CLICK needs a button number\n");
+				return true;
+			}
+			DEBUG_AgentMouseClick((uint8_t)button);
+			DEBUG_ShowMsg("DEBUG: MOUSE CLICK %d\n",button);
+		} else if (!strncmp(found,"STOP",4)) {
+			DEBUG_AgentInputStop();
+			DEBUG_ShowMsg("DEBUG: mouse injection stopped\n");
+		} else {
+			DEBUG_ShowMsg("DEBUG: MOUSE MOVE <x> <y> | BUTTON <n> DOWN|UP | CLICK <n> | STOP\n");
 		}
 		return true;
 	}
@@ -7813,6 +8084,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		return false;
 	}
 	if (CDbgCoverage::IsActive()) CDbgCoverage::Record((uint64_t)SegPhys(cs)+(uint64_t)reg_eip);
+	if (!input_events.empty()) DEBUG_InputRunTimers();
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
 		debug_stop_reason = "breakpoint";
 		return true;

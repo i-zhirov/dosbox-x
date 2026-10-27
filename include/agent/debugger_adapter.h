@@ -144,6 +144,13 @@ public:
                      std::vector<NativeFileIoRecord>* records, bool* has_next,
                      std::uint64_t* next_cursor, std::string* error) const;
     bool FileIoStop(std::uint64_t* records, std::string* error) const;
+    bool InputKeyText(const std::string& text, std::uint32_t* injected, std::string* error) const;
+    bool InputKeyScan(std::uint32_t scan, std::uint32_t* injected, std::string* error) const;
+    bool InputKeyScript(const std::string& path, std::uint32_t* lines, std::string* error) const;
+    bool InputKeyStop(std::string* error) const;
+    bool InputMouseMove(int x, int y, std::string* error) const;
+    bool InputMouseButton(std::uint8_t button, bool down, std::string* error) const;
+    bool InputMouseClick(std::uint8_t button, std::string* error) const;
     bool IsTraceComplete() const;
     bool TerminateTarget(std::string* error) const;
 };

@@ -40,6 +40,7 @@ const char* Mouse_GetSelected(int x1, int y1, int x2, int y2, int w, int h, uint
 #if defined(WIN32) || defined(MACOSX) || defined(C_SDL2)
 void Mouse_Select(int x1, int y1, int x2, int y2, int w, int h, bool select);
 #endif
+void Mouse_InjectMove(int x, int y);
 void Mouse_ButtonPressed(uint8_t button);
 void Mouse_ButtonReleased(uint8_t button);
 void Mouse_WheelMoved(int32_t scroll);

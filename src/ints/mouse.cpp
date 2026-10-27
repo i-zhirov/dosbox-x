@@ -1214,6 +1214,15 @@ void Mouse_Select(int x1, int y1, int x2, int y2, int w, int h, bool select) {
 }
 #endif
 
+void Mouse_InjectMove(int x, int y) {
+    if (x < mouse.min_x) x = mouse.min_x;
+    else if (x > mouse.max_x) x = mouse.max_x;
+    if (y < mouse.min_y) y = mouse.min_y;
+    else if (y > mouse.max_y) y = mouse.max_y;
+    mouse.x = (float)x;
+    mouse.y = (float)y;
+}
+
 void Mouse_ButtonPressed(uint8_t button) {
     if (!IS_PC98_ARCH && KEYBOARD_AUX_Active()) {
         switch (button) {

@@ -902,6 +902,124 @@ bool DebuggerAdapter::FileIoStop(std::uint64_t* records, std::string* error) con
 #endif
 }
 
+bool DebuggerAdapter::InputKeyText(const std::string& text, std::uint32_t* injected,
+                                    std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || text.empty())
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentKeyText(text.c_str(), injected)) {
+        if (error != NULL)
+            *error = "Debugger rejected the key text";
+        return false;
+    }
+    return true;
+#else
+    (void)injected;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputKeyScan(const std::uint32_t scan, std::uint32_t* injected,
+                                   std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentKeyScan(scan, injected)) {
+        if (error != NULL)
+            *error = "Debugger rejected the scan code";
+        return false;
+    }
+    return true;
+#else
+    (void)injected;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputKeyScript(const std::string& path, std::uint32_t* lines,
+                                     std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || path.empty())
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentKeyScript(path.c_str(), lines)) {
+        if (error != NULL)
+            *error = "Debugger could not read the key script";
+        return false;
+    }
+    return true;
+#else
+    (void)lines;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputKeyStop(std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    DEBUG_AgentKeyStop();
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputMouseMove(const int x, const int y, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    DEBUG_AgentMouseMove(x, y);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputMouseButton(const std::uint8_t button, const bool down,
+                                       std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentMouseButton(button, down)) {
+        if (error != NULL)
+            *error = "Debugger rejected the mouse button";
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::InputMouseClick(const std::uint8_t button, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentMouseClick(button)) {
+        if (error != NULL)
+            *error = "Debugger rejected the mouse click";
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool DebuggerAdapter::IsTraceComplete() const
 {
 #if C_HEAVY_DEBUG

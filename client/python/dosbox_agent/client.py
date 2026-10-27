@@ -408,6 +408,36 @@ class AgentClient:
                           result.get("condition") if isinstance(result.get("condition"), str) else None,
                           resolved if isinstance(resolved, Mapping) else None)
 
+    def input_key(self, session_id: str, *, text: str | None = None, scan: int | None = None,
+                  script: str | Path | None = None, stop: bool = False,
+                  request_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id}
+        if text is not None:
+            params["text"] = text
+        if scan is not None:
+            if scan < 0 or scan > 0xFF:
+                raise ValueError("scan must be a byte")
+            params["scan"] = scan
+        if script is not None:
+            params["script"] = str(script)
+        if stop:
+            params["stop"] = True
+        return self.call("input.key", params, request_id)
+
+    def input_mouse(self, session_id: str, action: str, *, x: int | None = None, y: int | None = None,
+                    button: int | None = None, down: bool | None = None,
+                    request_id: str | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"session_id": session_id, "action": action}
+        if x is not None:
+            params["x"] = x
+        if y is not None:
+            params["y"] = y
+        if button is not None:
+            params["button"] = button
+        if down is not None:
+            params["down"] = down
+        return self.call("input.mouse", params, request_id)
+
     def fileio_start(self, session_id: str, path: str | Path, request_id: str | None = None) -> str:
         result = self.call("fileio.start", {"session_id": session_id, "path": str(path)}, request_id)
         return _string(result, "path")
