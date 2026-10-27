@@ -30,10 +30,10 @@ class AgentSocketTests(unittest.TestCase):
     def setUp(self) -> None:
         self.work_dir = WORK_DIR.resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.socket_path = self.work_dir / f"agent_{os.getpid()}.sock"
+        self.socket_path = self.work_dir / f"agent_{os.getpid()}_{self._testMethodName}.sock"
         if self.socket_path.exists():
             self.socket_path.unlink()
-        self.config_path = self.work_dir / f"agent_{os.getpid()}.env"
+        self.config_path = self.work_dir / f"agent_{os.getpid()}_{self._testMethodName}.env"
         self.config_path.write_text(
             "\n".join(
                 [

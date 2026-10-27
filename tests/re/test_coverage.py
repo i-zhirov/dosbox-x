@@ -39,10 +39,10 @@ class CoverageTests(unittest.TestCase):
         self.runtime_dir = self.work_dir / "runtime"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(FIXTURE, self.runtime_dir / "RELOOP.COM")
-        self.socket_path = self.work_dir / f"coverage_{os.getpid()}.sock"
+        self.socket_path = self.work_dir / f"coverage_{os.getpid()}_{self._testMethodName}.sock"
         if self.socket_path.exists():
             self.socket_path.unlink()
-        self.config_path = self.work_dir / f"coverage_{os.getpid()}.env"
+        self.config_path = self.work_dir / f"coverage_{os.getpid()}_{self._testMethodName}.env"
         self.config_path.write_text(
             "\n".join(
                 [
@@ -60,7 +60,9 @@ class CoverageTests(unittest.TestCase):
             )
         )
         # The emulator config carries the MCP port for the debugger commands.
-        self.mcp_port = 9899
+        # A free port, so a previous emulator cannot hold it.
+        self.mcp = McpClient()
+        self.mcp_port = self.mcp.port
         self.emulator_config = self.work_dir / "coverage.conf"
         self.emulator_config.write_text(
             "\n".join(
@@ -78,7 +80,6 @@ class CoverageTests(unittest.TestCase):
                 ]
             )
         )
-        self.mcp = McpClient(self.mcp_port)
         env = dict(os.environ)
         env["SDL_VIDEODRIVER"] = "dummy"
         env["SDL_AUDIODRIVER"] = "dummy"

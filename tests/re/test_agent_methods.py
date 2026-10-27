@@ -36,10 +36,10 @@ class AgentMethodTests(unittest.TestCase):
         self.runtime_dir = self.work_dir / "runtime"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(FIXTURE, self.runtime_dir / "RELOOP.COM")
-        self.socket_path = self.work_dir / f"methods_{os.getpid()}.sock"
+        self.socket_path = self.work_dir / f"methods_{os.getpid()}_{self._testMethodName}.sock"
         if self.socket_path.exists():
             self.socket_path.unlink()
-        self.config_path = self.work_dir / f"methods_{os.getpid()}.env"
+        self.config_path = self.work_dir / f"methods_{os.getpid()}_{self._testMethodName}.env"
         self.config_path.write_text(
             "\n".join(
                 [

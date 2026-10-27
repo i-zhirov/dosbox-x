@@ -37,10 +37,10 @@ class MemoryToolTests(unittest.TestCase):
         log_path = self.work_dir / "LOGCPU.TXT"
         if log_path.exists():
             log_path.unlink()
-        self.socket_path = self.work_dir / f"memory_{os.getpid()}.sock"
+        self.socket_path = self.work_dir / f"memory_{os.getpid()}_{self._testMethodName}.sock"
         if self.socket_path.exists():
             self.socket_path.unlink()
-        self.config_path = self.work_dir / f"memory_{os.getpid()}.env"
+        self.config_path = self.work_dir / f"memory_{os.getpid()}_{self._testMethodName}.env"
         self.config_path.write_text(
             "\n".join(
                 [
@@ -58,7 +58,9 @@ class MemoryToolTests(unittest.TestCase):
             )
         )
         # The emulator config carries the MCP port for the debugger commands.
-        self.mcp_port = 9898
+        # A free port, so a previous emulator cannot hold it.
+        self.mcp = McpClient()
+        self.mcp_port = self.mcp.port
         self.emulator_config = self.work_dir / f"memory_{os.getpid()}.conf"
         self.emulator_config.write_text(
             "\n".join(
@@ -76,7 +78,6 @@ class MemoryToolTests(unittest.TestCase):
                 ]
             )
         )
-        self.mcp = McpClient(self.mcp_port)
         env = dict(os.environ)
         env["SDL_VIDEODRIVER"] = "dummy"
         env["SDL_AUDIODRIVER"] = "dummy"
