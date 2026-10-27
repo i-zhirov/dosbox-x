@@ -363,6 +363,8 @@ bool	exitLoop	= false;
 static ofstream 	cpuLogFile;
 static bool		cpuLog			= false;
 static int		cpuLogCounter	= 0;
+static uint32_t	cpuLogFilter	= 0;
+static bool		cpuLogFilterSet	= false;
 static int		cpuLogType		= 1;	// log detail
 static bool zeroProtect = false;
 bool	logHeavy	= false;
@@ -3450,6 +3452,69 @@ bool ParseCommand(char* str) {
 			}
 			return true;
 		}
+		/* The one-shot search accepts a quoted string, a byte sequence of
+		 * two or more bytes, and the ?? wildcard, and reports every hit
+		 * with its linear address. */
+		{
+			std::vector<uint8_t> pattern;
+			std::vector<bool> known;
+			bool oneshot = false;
+			const char* scan = found;
+			if (*scan == '"') {
+				scan++;
+				while (*scan != 0 && *scan != '"') {
+					pattern.push_back((uint8_t)*scan);
+					known.push_back(true);
+					scan++;
+				}
+				oneshot = (*scan == '"') && !pattern.empty();
+			} else {
+				std::vector<uint8_t> bytes;
+				std::vector<bool> mask;
+				bool all = true;
+				while (*scan != 0) {
+					while (*scan == ' ' || *scan == '\t') scan++;
+					if (*scan == 0) break;
+					if (scan[0] == '?' && scan[1] == '?') {
+						bytes.push_back(0);
+						mask.push_back(false);
+						scan += 2;
+					} else if (isxdigit((unsigned char)scan[0]) && isxdigit((unsigned char)scan[1]) &&
+							(scan[2] == 0 || scan[2] == ' ' || scan[2] == '\t')) {
+						bytes.push_back((uint8_t)strtoul(std::string(scan,2).c_str(),NULL,16));
+						mask.push_back(true);
+						scan += 2;
+					} else {
+						all = false;
+						break;
+					}
+				}
+				if (all && bytes.size() >= 3) {
+					oneshot = true;
+					pattern = bytes;
+					known = mask;
+				}
+			}
+			if (oneshot) {
+				const uint32_t memBytes = (uint32_t)(MEM_TotalPages() << 12);
+				uint32_t hits = 0;
+				for (uint32_t addr = 0; addr + (uint32_t)pattern.size() <= memBytes; addr++) {
+					bool match = true;
+					for (size_t i = 0; i < pattern.size(); i++) {
+						if (!known[i]) continue;
+						uint8_t b = 0;
+						if (mem_readb_checked((PhysPt)(addr + (uint32_t)i),&b)) { match = false; break; }
+						if (b != pattern[i]) { match = false; break; }
+					}
+					if (match) {
+						hits++;
+						DEBUG_ShowMsg("DEBUG: [MEMFIND] Hit %u at linear %08X\n",hits,(unsigned)addr);
+					}
+				}
+				DEBUG_ShowMsg("DEBUG: [MEMFIND] Matches found: %u\n",hits);
+				return true;
+			}
+		}
 		DbgAddress address;
 		uint32_t num = 0;
 		if (!*found) {
@@ -3578,7 +3643,14 @@ bool ParseCommand(char* str) {
 				found+=1;
 				MEMFINDInstance->opType = 0;
 				sprintf(opTypeStr, "EQUAL TO");
+				break;
 			default:
+				if (*found != 0 && !isxdigit((unsigned char)*found)) {
+					DEBUG_ShowMsg("DEBUG: MEMS - Memory Search from MEMFIND instance.\n");
+					DEBUG_ShowMsg("DEBUG: Usage: MEMS (OPERATOR) VALUE.\n");
+					DEBUG_ShowMsg("DEBUG: Valid operators: >, >=, <, <=, !, =.\n");
+					return true;
+				}
 				MEMFINDInstance->opType = 0;
 				sprintf(opTypeStr, "EQUAL TO");
 				break;
@@ -3603,7 +3675,9 @@ bool ParseCommand(char* str) {
 			MEMFINDInstance->usePreviousValue = false;
 		}
 		uint32_t y = 0;	//This index is seperated from the for loop, as the for loop can start from any index while this particular index starts at 0
-		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
+		for (uint32_t i = MEMFINDInstance->baseLinear;
+				i + MEMFINDInstance->size <= MEMFINDInstance->baseLinear + MEMFINDInstance->range;
+				i+=MEMFINDInstance->size){
 			valfind = 0;
 			MemFindRead(*MEMFINDInstance,i,valfind);
 			if (MEMFINDInstance->usePreviousValue == true){
@@ -3690,8 +3764,46 @@ bool ParseCommand(char* str) {
 		name[15] = 0;
 
 		if(!name[0]) return false;
-		DEBUG_ShowMsg("DEBUG: Created debug var %s at %04X:%04X\n",name,seg,ofs);
-		CDebugVar::InsertVariable(name,(PhysPt)GetAddress(seg,ofs));
+		{
+			DbgAddress address;
+			address.space = DBG_SPACE_SEGMENTED;
+			address.selector = seg;
+			address.offset = ofs;
+			DbgResolved resolved = ResolveDbgAddress(address);
+			if (!resolved.valid) {
+				DEBUG_ShowMsg("DEBUG: IV: %s\n",resolved.error);
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: Created debug var %s at %04X:%04X (linear %08X)\n",name,seg,ofs,(unsigned)resolved.linear);
+			CDebugVar::InsertVariable(name,(PhysPt)resolved.linear);
+		}
+		return true;
+	}
+
+	if (command == "VV") { // View variable
+		char name[16];
+		SkipSpace(found);
+		for (int i=0; i<16; i++) {
+			if (found[i] && (found[i]!=' ')) name[i] = found[i];
+			else { name[i] = 0; break; }
+		}
+		name[15] = 0;
+		if(!name[0]) {
+			DEBUG_ShowMsg("DEBUG: VV needs a variable name\n");
+			return true;
+		}
+		CDebugVar* variable = CDebugVar::FindVar(name);
+		if (variable == NULL) {
+			DEBUG_ShowMsg("DEBUG: VV: no debug var %s\n",name);
+			return true;
+		}
+		const PhysPt adr = variable->GetAdr();
+		uint32_t value = 0;
+		if (mem_readd_checked(adr,&value)) {
+			DEBUG_ShowMsg("DEBUG: VV %s (linear %08X): read failed\n",name,(unsigned)adr);
+			return true;
+		}
+		DEBUG_ShowMsg("DEBUG: VV %s (linear %08X): %08X\n",name,(unsigned)adr,(unsigned)value);
 		return true;
 	}
 
@@ -3825,22 +3937,38 @@ bool ParseCommand(char* str) {
 				break;
 			}
 
+			const uint32_t width = (prefix == 'D') ? 4 : (prefix == 'W') ? 2 : 1;
+			if (((uint64_t)ofs + count + width) > ((uint64_t)MEM_TotalPages() << 12)) {
+				DEBUG_ShowMsg("DEBUG: Memory write failed at %08X\n",(unsigned)(ofs+count));
+				break;
+			}
 			if (prefix == 'D') {
-				mem_writed_checked((PhysPt)(ofs+count),value);
+				if (mem_writed_checked((PhysPt)(ofs+count),value)) {
+					DEBUG_ShowMsg("DEBUG: Memory write failed at %08X\n",(unsigned)(ofs+count));
+					break;
+				}
 				count += 4;
 			}
 			else if (prefix == 'W') {
-				mem_writew_checked((PhysPt)(ofs+count),value);
+				if (mem_writew_checked((PhysPt)(ofs+count),value)) {
+					DEBUG_ShowMsg("DEBUG: Memory write failed at %08X\n",(unsigned)(ofs+count));
+					break;
+				}
 				count += 2;
 			}
 			else if (prefix == 'B') {
-				mem_writeb_checked((PhysPt)(ofs+count),value);
+				if (mem_writeb_checked((PhysPt)(ofs+count),value)) {
+					DEBUG_ShowMsg("DEBUG: Memory write failed at %08X\n",(unsigned)(ofs+count));
+					break;
+				}
 				count++;
 			}
 		}
 
 		if (count > 0)
 			DEBUG_ShowMsg("DEBUG: Memory changed (%u bytes)\n",(unsigned int)count);
+		else
+			DEBUG_ShowMsg("DEBUG: Memory unchanged\n");
 
 		return true;
 	}
@@ -4517,6 +4645,18 @@ bool ParseCommand(char* str) {
 #if C_HEAVY_DEBUG
 
 	if (command == "LOG") { // Create Cpu normal log file
+		SkipSpace(found);
+		if (!strncmp(found,"STOP",4)) {
+			if (cpuLog) {
+				cpuLogFile.flush();
+				cpuLogFile.close();
+				cpuLog = false;
+				DEBUG_ShowMsg("DEBUG: cpu log LOGCPU.TXT stopped\n");
+			} else {
+				DEBUG_ShowMsg("DEBUG: no cpu log is active\n");
+			}
+			return true;
+		}
 		cpuLogType = 1;
 		command = "logcode";
 	}
@@ -4547,6 +4687,13 @@ bool ParseCommand(char* str) {
 		cpuLogFile << hex << noshowbase << setfill('0') << uppercase;
 		cpuLog = true;
 		cpuLogCounter = (int)GetHexValue(found,found);
+		SkipSpace(found);
+		/* A start filter holds the linear address where the log starts. */
+		cpuLogFilterSet = false;
+		if (*found != 0) {
+			cpuLogFilter = (uint32_t)GetHexValue(found,found);
+			cpuLogFilterSet = true;
+		}
 
 		debugging = false;
 		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
@@ -5743,6 +5890,10 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("COVER  STOP|RESET|STATS|DUMP <file>\n");
 		DEBUG_ShowMsg("FILEIO START <file>       - Trace the DOS file calls to a JSONL file.\n");
 		DEBUG_ShowMsg("FILEIO STOP|STATUS\n");
+		DEBUG_ShowMsg("KEY <text>|SCAN <code>|SCRIPT <file>|STOP - Inject a key.\n");
+		DEBUG_ShowMsg("MOUSE MOVE <x> <y>|BUTTON <n> DOWN|UP|CLICK <n>|STOP\n");
+		DEBUG_ShowMsg("SCREEN TEXT <file>       - Capture the 25 text rows from B800:0.\n");
+		DEBUG_ShowMsg("SCREEN IMAGE <file>      - Capture the rendered frame as a PNG.\n");
 		DEBUG_ShowMsg("S:     selector and offset, L: linear, P: physical\n");
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
@@ -5758,7 +5909,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("CALLBACKS                 - Show callbacks of interrupts.\n");
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
 #if C_HEAVY_DEBUG
-		DEBUG_ShowMsg("LOG [num]                 - Write CPU log file.\n");
+		DEBUG_ShowMsg("LOG [num] [start addr]    - Write CPU log file (LOG STOP ends it).\n");
 		DEBUG_ShowMsg("LOGS/LOGL/LOGC [num]      - Write short/long/cs:ip-only CPU log file.\n");
 		DEBUG_ShowMsg("HEAVYLOG                  - Enable/Disable automatic CPU log when DOSBox-X exits.\n");
 		DEBUG_ShowMsg("ZEROPROTECT               - Enable/Disable zero code execution detection.\n");
@@ -5769,7 +5920,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("SMV [addr] [val] [.]..    - Set memory with following values at linear (virtual) address.\n");
 		DEBUG_ShowMsg("FM [seg]:[off]            - Freeze memory value at address.\n");
 		DEBUG_ShowMsg("EV [value [value] ...]    - Show register value(s).\n");
-		DEBUG_ShowMsg("IV [seg]:[off] [name]     - Create var name for memory address.\n");
+		DEBUG_ShowMsg("IV [seg]:[off] [name]     - Create var name for memory address.\n");		DEBUG_ShowMsg("VV [name]                 - Read the contents of a debug var.\n");
 		DEBUG_ShowMsg("SV [filename]             - Save var list in file.\n");
 		DEBUG_ShowMsg("LV [filename]             - Load var list from file.\n");
 
@@ -5780,6 +5931,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("MEMDUMP [S:|L:|P:]addr [len] [file] - Write memory to a text file (default: MEMDUMP.TXT).\n");
 		DEBUG_ShowMsg("MEMDUMPBIN [S:|L:|P:]addr [len] [file] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
         DEBUG_ShowMsg("MEMFIND [S:|L:|P:]addr [range] - Start memory find search instance.\n");
+		DEBUG_ShowMsg("MEMFIND <bytes>|\"string\"     - Find a byte sequence or a string.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
 
@@ -8121,9 +8273,16 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	}
 #endif
 	if (cpuLog) {
-		if (cpuLogCounter>0) {
-			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
-			cpuLogCounter--;
+		const uint32_t log_linear = (uint32_t)SegPhys(cs)+(uint32_t)reg_eip;
+		if (!cpuLogFilterSet || log_linear >= cpuLogFilter) {
+			if (cpuLogFilterSet) cpuLogFilterSet = false;
+			if (cpuLogCounter>0) {
+				LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
+				cpuLogCounter--;
+				/* Flush the log periodically, so a long run keeps the
+				 * file complete when the emulator stops. */
+				if ((cpuLogCounter % 1000) == 0) cpuLogFile.flush();
+			}
 		}
 		if (cpuLogCounter<=0) {
 			cpuLogFile.flush();
