@@ -149,14 +149,40 @@ std::vector<std::string> EndCapture()
                       "[%lu debug output lines discarded]",
                       static_cast<unsigned long>(g_capture_discarded));
         lines.emplace_back(message);
+
+        std::snprintf(message,
+                      sizeof(message),
+                      "DROPPED %lu",
+                      static_cast<unsigned long>(g_capture_discarded));
+        lines.emplace_back(message);
+
         g_capture_discarded = 0;
     }
 
     return lines;
 }
 
-void CloseConnection()
+bool SendAll(const std::string& data);
+
+void SendBye(const char* reason)
 {
+    if (!g_socket)
+        return;
+
+    std::string message = std::string("BEGIN event OK\nBYE ") +
+                          SanitizeProtocolLine(reason ? reason : "unknown") +
+                          "\nEND event\n";
+
+    // Best effort: the peer may be gone already.
+    SendAll(message);
+}
+
+void CloseConnection(const char* reason)
+{
+    // A final event names the close reason when the connection is still up.
+    if (g_connected.load() && reason != nullptr && std::string(reason) != "peer")
+        SendBye(reason);
+
     g_connected.store(false);
 
     if (g_socket) {
@@ -405,7 +431,7 @@ void ThreadMain()
             std::fprintf(stderr,
                          "[ControlClient] connection lost while sending\n");
 
-            CloseConnection();
+            CloseConnection("send");
             continue;
         }
 
@@ -423,7 +449,7 @@ void ThreadMain()
                          "[ControlClient] SDLNet_CheckSockets failed: %s\n",
                          SDLNet_GetError());
 
-            CloseConnection();
+            CloseConnection("send");
             continue;
         }
 
@@ -432,16 +458,21 @@ void ThreadMain()
 
         if (g_socket && SDLNet_SocketReady(g_socket)) {
             if (!Receive()) {
-                std::fprintf(stderr,
-                             "[ControlClient] connection closed\n");
+                const bool overflow =
+                        g_receive_buffer.size() > MAX_RECEIVE_BUFFER;
 
-                CloseConnection();
+                std::fprintf(stderr,
+                             "[ControlClient] %s\n",
+                             overflow ? "receive buffer overflow"
+                                      : "connection closed");
+
+                CloseConnection(overflow ? "overflow" : "peer");
                 continue;
             }
         }
     }
 
-    CloseConnection();
+    CloseConnection("stop");
 }
 
 bool ParseControlRequest(const std::string& line,
@@ -503,6 +534,13 @@ void SendResponse(const std::string& id,
                   const std::vector<std::string>& lines)
 {
     std::string response = std::string("BEGIN ") + id + (ok ? " OK" : " ERR");
+
+    // The success frame holds the line count, so a client consumes exactly the
+    // lines that follow and a captured line cannot end the frame.
+    if (ok) {
+        response += " ";
+        response += std::to_string(lines.size());
+    }
 
     for (const auto& line : lines) {
         response.push_back('\n');
