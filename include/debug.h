@@ -65,6 +65,45 @@ bool DEBUG_AgentCoverageRead(std::vector<DEBUG_AgentCoverageRange>* ranges,
                              uint64_t* start, uint64_t* length,
                              uint64_t* covered, uint64_t* dropped);
 bool DEBUG_AgentCoverageStop(uint64_t* covered);
+
+// The file-I/O record, for the DOS file calls and the agent fileio methods.
+struct DEBUG_AgentFileIoRecord {
+    uint64_t sequence = 0;
+    std::string event;
+    std::string name;
+    uint32_t handle = 0;
+    uint32_t offset = 0;
+    uint32_t count = 0;
+};
+
+bool DEBUG_AgentFileIoStart(const char* filename);
+bool DEBUG_AgentFileIoRead(uint64_t cursor, bool has_cursor, uint32_t limit,
+                            std::vector<DEBUG_AgentFileIoRecord>* records,
+                            bool* has_next, uint64_t* next_cursor);
+bool DEBUG_AgentFileIoStop(uint64_t* records);
+
+// The file-I/O record used by the DOS file calls.
+class CDbgFileIo {
+public:
+    static bool Start(const char* filename);
+    static void Stop();
+    static bool IsActive();
+    static void Record(const char* event, const char* name, uint16_t handle,
+                        uint32_t offset, uint32_t count);
+    static bool Read(uint64_t cursor, bool has_cursor, uint32_t limit,
+                      std::vector<DEBUG_AgentFileIoRecord>* records,
+                      bool* has_next, uint64_t* next_cursor);
+    static std::string Status();
+    static uint64_t GetRecords() { return records; }
+
+private:
+    static FILE* file;
+    static std::string path;
+    static uint64_t records;
+    static uint64_t dropped;
+    static std::vector<DEBUG_AgentFileIoRecord> list;
+    static bool active;
+};
 bool DEBUG_AgentDeleteBreakpoint(uintptr_t handle);
 uintptr_t DEBUG_AgentConsumeLastBreakpoint(void);
 void DEBUG_AgentClearLastBreakpoint(void);

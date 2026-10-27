@@ -408,6 +408,20 @@ class AgentClient:
                           result.get("condition") if isinstance(result.get("condition"), str) else None,
                           resolved if isinstance(resolved, Mapping) else None)
 
+    def fileio_start(self, session_id: str, path: str | Path, request_id: str | None = None) -> str:
+        result = self.call("fileio.start", {"session_id": session_id, "path": str(path)}, request_id)
+        return _string(result, "path")
+
+    def fileio_read(self, session_id: str, cursor: str | None = None, limit: int = 100,
+                     request_id: str | None = None) -> dict[str, Any]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        return self.call("fileio.read", {"session_id": session_id, "cursor": cursor, "limit": limit}, request_id)
+
+    def fileio_stop(self, session_id: str, request_id: str | None = None) -> int:
+        result = self.call("fileio.stop", {"session_id": session_id}, request_id)
+        return _integer(result, "records")
+
     def coverage_start(self, session_id: str, start: MemoryAddress, length: int,
                         request_id: str | None = None) -> None:
         if length <= 0:

@@ -832,6 +832,76 @@ bool DebuggerAdapter::CoverageStop(std::uint64_t* covered, std::string* error) c
 #endif
 }
 
+bool DebuggerAdapter::FileIoStart(const std::string& path, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || path.empty())
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentFileIoStart(path.c_str())) {
+        if (error != NULL)
+            *error = "Debugger could not open the file-I/O trace file";
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::FileIoRead(const std::uint64_t cursor, const bool has_cursor,
+                                 const std::uint32_t limit,
+                                 std::vector<NativeFileIoRecord>* records,
+                                 bool* has_next, std::uint64_t* next_cursor,
+                                 std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) ||
+            records == NULL || has_next == NULL || next_cursor == NULL || limit == 0)
+        return false;
+
+#if C_DEBUG
+    std::vector<DEBUG_AgentFileIoRecord> native_records;
+    if (!DEBUG_AgentFileIoRead(cursor, has_cursor, limit, &native_records, has_next, next_cursor)) {
+        if (error != NULL)
+            *error = "Debugger has no file-I/O record";
+        return false;
+    }
+    records->clear();
+    for (std::vector<DEBUG_AgentFileIoRecord>::const_iterator it = native_records.begin(); it != native_records.end(); ++it) {
+        NativeFileIoRecord record;
+        record.sequence = it->sequence;
+        record.event = it->event;
+        record.name = it->name;
+        record.handle = it->handle;
+        record.offset = it->offset;
+        record.count = it->count;
+        records->push_back(record);
+    }
+    return true;
+#else
+    (void)records;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::FileIoStop(std::uint64_t* records, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentFileIoStop(records)) {
+        if (error != NULL)
+            *error = "Debugger rejected the file-I/O stop";
+        return false;
+    }
+    return true;
+#else
+    (void)records;
+    return false;
+#endif
+}
+
 bool DebuggerAdapter::IsTraceComplete() const
 {
 #if C_HEAVY_DEBUG

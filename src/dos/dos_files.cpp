@@ -31,6 +31,7 @@
 #include "mem.h"
 #include "regs.h"
 #include "dos_inc.h"
+#include "debug.h"
 #include "drives.h"
 #include "cross.h"
 #include "control.h"
@@ -824,6 +825,8 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
     if (log_fileio) {
         LOG(LOG_FILES, LOG_DEBUG)("Reading %d bytes from %s ", *amount, Files[handle]->name);
     }
+    if (CDbgFileIo::IsActive())
+        CDbgFileIo::Record("read",Files[handle]->name,handle,Files[handle]->GetSeekPos(),*amount);
 /*
 	if ((Files[handle]->flags & 0x0f) == OPEN_WRITE)) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
@@ -858,6 +861,8 @@ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fc
     if (log_fileio) {
         LOG(LOG_FILES, LOG_DEBUG)("Writing %d bytes to %s", *amount, Files[handle]->name);
     }
+    if (CDbgFileIo::IsActive())
+        CDbgFileIo::Record("write",Files[handle]->name,handle,Files[handle]->GetSeekPos(),*amount);
 /*
 	if ((Files[handle]->flags & 0x0f) == OPEN_READ)) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
@@ -890,6 +895,8 @@ bool DOS_SeekFile(uint16_t entry,uint32_t * pos,uint32_t type,bool fcb) {
 	if (log_fileio) {
 		LOG(LOG_FILES, LOG_DEBUG)("Seeking to %d bytes from position type (%d) in %s ", *pos, type, Files[handle]->name);
 	}
+	if (CDbgFileIo::IsActive())
+		CDbgFileIo::Record("seek",Files[handle]->name,handle,*pos,0);
 
 	return Files[handle]->Seek(pos,type);
 }
@@ -929,6 +936,8 @@ bool DOS_CloseFile(uint16_t entry, bool fcb, uint8_t * refcnt) {
         if (log_fileio) {
             LOG(LOG_FILES, LOG_NORMAL)("Closing file %s", Files[handle]->name);
         }
+        if (CDbgFileIo::IsActive())
+            CDbgFileIo::Record("close",Files[handle]->name,handle,0,0);
         Files[handle]->Close();
 	}
 
@@ -1126,6 +1135,8 @@ bool DOS_OpenFile(char const * name,uint8_t flags,uint16_t * entry,bool fcb) {
 		Files[handle]->AddRef();
 		psp.SetFileHandle(*entry,handle);
 		Files[handle]->drive = drive;
+		if (CDbgFileIo::IsActive())
+			CDbgFileIo::Record("open",Files[handle]->name,handle,0,0);
 		return true;
 	} else {
 		//Test if file exists, but opened in read-write mode (and writeprotected)

@@ -797,6 +797,8 @@ private:
 	static std::vector<uint8_t>	bits;
 	static uint64_t			covered;
 	static uint64_t			dropped;
+	static std::vector<DEBUG_AgentFileIoRecord>	list;
+	static std::string		path;
 	static bool				active;
 };
 
@@ -883,6 +885,113 @@ std::string CDbgCoverage::Stats(void)
 		(unsigned)covered,(unsigned)length,
 		(unsigned)(length ? (covered * 100u / length) : 0u),(unsigned)dropped);
 	return buffer;
+}
+
+/* The file-I/O record.  It writes one JSON object per line and keeps a
+ * bounded in-memory list for the agent reads.  It runs on the emulation
+ * thread, so it needs no lock. */
+#define MAX_FILEIO_RECORDS 100000
+
+FILE* CDbgFileIo::file = NULL;
+std::string CDbgFileIo::path;
+uint64_t CDbgFileIo::records = 0;
+uint64_t CDbgFileIo::dropped = 0;
+std::vector<DEBUG_AgentFileIoRecord> CDbgFileIo::list;
+bool CDbgFileIo::active = false;
+
+static std::string JsonEscape(const char *text)
+{
+	std::string result;
+	for (const char *p=text; p != NULL && *p != 0; ++p) {
+		if (*p == '"' || *p == '\\') result.push_back('\\');
+		result.push_back(*p);
+	}
+	return result;
+}
+
+bool CDbgFileIo::Start(const char *filename)
+{
+	Stop();
+	file = fopen(filename,"wt");
+	if (!file) return false;
+	path = filename ? filename : "";
+	records = 0;
+	dropped = 0;
+	list.clear();
+	active = true;
+	return true;
+}
+
+void CDbgFileIo::Stop(void)
+{
+	if (file != NULL) { fclose(file); file = NULL; }
+	active = false;
+}
+
+bool CDbgFileIo::IsActive(void)
+{
+	return active;
+}
+
+void CDbgFileIo::Record(const char *event,const char *name,uint16_t handle,uint32_t offset,uint32_t count)
+{
+	if (!active) return;
+	const std::string safe_name = JsonEscape(name);
+	if (file != NULL) {
+		fprintf(file,"{\"event\":\"%s\",\"name\":\"%s\",\"handle\":%u,\"offset\":%u,\"count\":%u}\n",
+			event ? event : "",safe_name.c_str(),(unsigned)handle,(unsigned)offset,(unsigned)count);
+		fflush(file);
+	}
+	if (list.size() >= MAX_FILEIO_RECORDS) { dropped++; return; }
+	DEBUG_AgentFileIoRecord record;
+	record.sequence = ++records;
+	record.event = event ? event : "";
+	record.name = safe_name;
+	record.handle = handle;
+	record.offset = offset;
+	record.count = count;
+	list.push_back(record);
+}
+
+std::string CDbgFileIo::Status(void)
+{
+	char buffer[256];
+	std::snprintf(buffer,sizeof(buffer),"%s, %u records, %u dropped, file %s",
+		active ? "active" : "stopped",(unsigned)records,(unsigned)dropped,path.c_str());
+	return buffer;
+}
+
+bool DEBUG_AgentFileIoStart(const char* filename)
+{
+	return CDbgFileIo::Start(filename);
+}
+
+bool CDbgFileIo::Read(uint64_t cursor,bool has_cursor,uint32_t limit,std::vector<DEBUG_AgentFileIoRecord>* records,bool* has_next,uint64_t* next_cursor)
+{
+	if (records == NULL || limit == 0) return false;
+	records->clear();
+	uint64_t index = 0;
+	if (has_cursor) index = cursor;
+	if (index > list.size()) index = list.size();
+	while (index < list.size() && records->size() < limit) {
+		records->push_back(list[(size_t)index]);
+		index++;
+	}
+	if (has_next != NULL) *has_next = index < list.size();
+	if (next_cursor != NULL) *next_cursor = index;
+	return true;
+}
+
+bool DEBUG_AgentFileIoRead(uint64_t cursor,bool has_cursor,uint32_t limit,std::vector<DEBUG_AgentFileIoRecord>* records,bool* has_next,uint64_t* next_cursor)
+{
+	return CDbgFileIo::Read(cursor,has_cursor,limit,records,has_next,next_cursor);
+}
+
+bool DEBUG_AgentFileIoStop(uint64_t* records)
+{
+	CDbgFileIo::Stop();
+	if (records != NULL) *records = CDbgFileIo::GetRecords();
+	return true;
 }
 
 class CBreakpoint
@@ -3677,6 +3786,31 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "FILEIO") {
+		while (*found == ' ') found++;
+		if (!strncmp(found,"START",5)) {
+			found += 5;
+			while (*found == ' ') found++;
+			if (!*found) {
+				DEBUG_ShowMsg("DEBUG: FILEIO START needs a file name\n");
+				return true;
+			}
+			if (!CDbgFileIo::Start(found)) {
+				DEBUG_ShowMsg("DEBUG: FILEIO START failed\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: File I/O trace started: %s\n",found);
+		} else if (!strncmp(found,"STOP",4)) {
+			CDbgFileIo::Stop();
+			DEBUG_ShowMsg("DEBUG: File I/O trace stopped\n");
+		} else if (!strncmp(found,"STATUS",6)) {
+			DEBUG_ShowMsg("DEBUG: %s\n",CDbgFileIo::Status().c_str());
+		} else {
+			DEBUG_ShowMsg("DEBUG: FILEIO START <file> | STOP | STATUS\n");
+		}
+		return true;
+	}
+
 	if (command == "COVER") {
 		while (*found == ' ') found++;
 		if (!strncmp(found,"START",5)) {
@@ -5264,6 +5398,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("PATCHB L:<addr> <byte>   - Patch a byte and restore it at the stop.\n");
 		DEBUG_ShowMsg("COVER  START <L:addr> <len> - Record the executed addresses (bitmap).\n");
 		DEBUG_ShowMsg("COVER  STOP|RESET|STATS|DUMP <file>\n");
+		DEBUG_ShowMsg("FILEIO START <file>       - Trace the DOS file calls to a JSONL file.\n");
+		DEBUG_ShowMsg("FILEIO STOP|STATUS\n");
 		DEBUG_ShowMsg("S:     selector and offset, L: linear, P: physical\n");
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");

@@ -58,6 +58,15 @@ struct NativeCoverage {
     std::vector<std::pair<std::uint64_t, std::uint64_t> > ranges;
 };
 
+struct NativeFileIoRecord {
+    std::uint64_t sequence = 0;
+    std::string event;
+    std::string name;
+    std::uint32_t handle = 0;
+    std::uint32_t offset = 0;
+    std::uint32_t count = 0;
+};
+
 struct TraceSample {
     MemoryAddress address;
     RegisterSnapshot registers;
@@ -130,6 +139,11 @@ public:
     bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const;
     bool CoverageRead(NativeCoverage* coverage, std::string* error) const;
     bool CoverageStop(std::uint64_t* covered, std::string* error) const;
+    bool FileIoStart(const std::string& path, std::string* error) const;
+    bool FileIoRead(std::uint64_t cursor, bool has_cursor, std::uint32_t limit,
+                     std::vector<NativeFileIoRecord>* records, bool* has_next,
+                     std::uint64_t* next_cursor, std::string* error) const;
+    bool FileIoStop(std::uint64_t* records, std::string* error) const;
     bool IsTraceComplete() const;
     bool TerminateTarget(std::string* error) const;
 };

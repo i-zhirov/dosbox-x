@@ -524,6 +524,9 @@ static bool IsKnownMethod(const std::string& method)
            method == "coverage.start" ||
            method == "coverage.read" ||
            method == "coverage.stop" ||
+           method == "fileio.start" ||
+           method == "fileio.read" ||
+           method == "fileio.stop" ||
            method == "breakpoints.list" ||
            method == "breakpoints.delete" ||
            method == "debug.output.read" ||
@@ -577,6 +580,9 @@ public:
         std::vector<std::uint8_t> before;
         std::vector<std::uint8_t> after;
         NativeCoverage coverage;
+        std::vector<NativeFileIoRecord> fileio_records;
+        bool fileio_has_next = false;
+        std::uint64_t fileio_next_cursor = 0;
     };
 
     struct AdapterOperation {
@@ -595,6 +601,9 @@ public:
         bool trace_active = false;
         std::size_t trace_event_count = 0;
         NativeCoverage coverage;
+        std::vector<NativeFileIoRecord> fileio_records;
+        bool fileio_has_next = false;
+        std::uint64_t fileio_next_cursor = 0;
     };
 
     struct StepOperation {
@@ -687,6 +696,11 @@ public:
     virtual bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const = 0;
     virtual bool CoverageRead(NativeCoverage* coverage, std::string* error) const = 0;
     virtual bool CoverageStop(std::uint64_t* covered, std::string* error) const = 0;
+    virtual bool FileIoStart(const std::string& path, std::string* error) const = 0;
+    virtual bool FileIoRead(std::uint64_t cursor, bool has_cursor, std::uint32_t limit,
+                            std::vector<NativeFileIoRecord>* records, bool* has_next,
+                            std::uint64_t* next_cursor, std::string* error) const = 0;
+    virtual bool FileIoStop(std::uint64_t* records, std::string* error) const = 0;
     virtual bool Step(StepMode mode, bool* continued, std::string* error) const = 0;
     virtual bool ReadMemory(const MemoryAddress& address,
                             std::size_t length,
@@ -747,6 +761,9 @@ public:
     AGENT_RUNTIME_FORWARD(CoverageStart, bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const, (start, length, error))
     AGENT_RUNTIME_FORWARD(CoverageRead, bool CoverageRead(NativeCoverage* coverage, std::string* error) const, (coverage, error))
     AGENT_RUNTIME_FORWARD(CoverageStop, bool CoverageStop(std::uint64_t* covered, std::string* error) const, (covered, error))
+    AGENT_RUNTIME_FORWARD(FileIoStart, bool FileIoStart(const std::string& path, std::string* error) const, (path, error))
+    AGENT_RUNTIME_FORWARD(FileIoRead, bool FileIoRead(std::uint64_t cursor, bool has_cursor, std::uint32_t limit, std::vector<NativeFileIoRecord>* records, bool* has_next, std::uint64_t* next_cursor, std::string* error) const, (cursor, has_cursor, limit, records, has_next, next_cursor, error))
+    AGENT_RUNTIME_FORWARD(FileIoStop, bool FileIoStop(std::uint64_t* records, std::string* error) const, (records, error))
     AGENT_RUNTIME_FORWARD(Step, bool Step(StepMode mode, bool* continued, std::string* error) const, (mode, continued, error))
     AGENT_RUNTIME_FORWARD(ReadMemory, bool ReadMemory(const MemoryAddress& address, std::size_t length, std::vector<std::uint8_t>* data, MemoryAccessError* access_error, std::string* error) const, (address, length, data, access_error, error))
     AGENT_RUNTIME_FORWARD(WriteMemory, bool WriteMemory(const MemoryAddress& address, const std::vector<std::uint8_t>& data, std::vector<std::uint8_t>* after, MemoryAccessError* access_error, std::string* error) const, (address, data, after, access_error, error))
@@ -804,6 +821,9 @@ public:
     AGENT_RUNTIME_UNAVAILABLE(CoverageStart, bool CoverageStart(std::uint64_t, std::uint64_t, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(CoverageRead, bool CoverageRead(NativeCoverage*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(CoverageStop, bool CoverageStop(std::uint64_t*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(FileIoStart, bool FileIoStart(const std::string&, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(FileIoRead, bool FileIoRead(std::uint64_t, bool, std::uint32_t, std::vector<NativeFileIoRecord>*, bool*, std::uint64_t*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(FileIoStop, bool FileIoStop(std::uint64_t*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(Step, bool Step(StepMode, bool*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(ReadMemory, bool ReadMemory(const MemoryAddress&, std::size_t, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(WriteMemory, bool WriteMemory(const MemoryAddress&, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
@@ -1310,6 +1330,7 @@ static std::string Capabilities(const AgentConfig& config)
     Add(&state, "set_registers", JsonValue::Bool(true));
     Add(&result, "state", state);
     Add(&result, "coverage", JsonValue::Bool(true));
+    Add(&result, "fileio", JsonValue::Bool(true));
     JsonValue spaces = JsonValue::Array();
     spaces.array.push_back(String("segmented"));
     spaces.array.push_back(String("linear"));
@@ -2096,6 +2117,170 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
                 } else {
                     JsonValue result = SessionResult(*session);
                     Add(&result, "covered", Number(operation->coverage.covered));
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "fileio.start") {
+        std::string path;
+        if (!GetString(parsed.params, "path", &path) || path.empty()) {
+            response = InvalidParams(parsed.id, "fileio.start requires a path");
+        } else if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation, path](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    const bool success = adapter.FileIoStart(path, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for fileio.start on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to start the file-I/O trace" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "path", String(path));
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "fileio.read") {
+        std::string validation_error;
+        bool has_cursor = false;
+        std::uint64_t cursor = 0;
+        std::uint32_t limit = 0;
+        const JsonValue* cursor_value = parsed.params.Find("cursor");
+        const JsonValue* limit_value = parsed.params.Find("limit");
+        if (!ParseCursor(cursor_value, "fio", &has_cursor, &cursor) || limit_value == NULL ||
+            !GetUnsignedInteger(*limit_value, &limit) || limit == 0) {
+            response = InvalidParams(parsed.id, validation_error.empty() ?
+                                     "fileio.read requires a cursor and a positive limit" : validation_error);
+        } else if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation, cursor, has_cursor, limit](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    std::vector<NativeFileIoRecord> records;
+                    bool has_next = false;
+                    std::uint64_t next_cursor = 0;
+                    const bool success = adapter.FileIoRead(cursor, has_cursor, limit, &records, &has_next, &next_cursor, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->fileio_records.swap(records);
+                        operation->fileio_has_next = has_next;
+                        operation->fileio_next_cursor = next_cursor;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for fileio.read on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to read the file-I/O record" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    JsonValue records = JsonValue::Array();
+                    for (std::size_t index = 0; index < operation->fileio_records.size(); ++index) {
+                        const NativeFileIoRecord& record = operation->fileio_records[index];
+                        JsonValue entry = Object();
+                        Add(&entry, "sequence", Number(record.sequence));
+                        Add(&entry, "event", String(record.event));
+                        Add(&entry, "name", String(record.name));
+                        Add(&entry, "handle", Number(record.handle));
+                        Add(&entry, "offset", Number(record.offset));
+                        Add(&entry, "count", Number(record.count));
+                        records.array.push_back(entry);
+                    }
+                    Add(&result, "records", records);
+                    Add(&result, "next_cursor", operation->fileio_has_next ?
+                        String("fio-" + std::to_string(operation->fileio_next_cursor)) : JsonValue::Null());
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "fileio.stop") {
+        if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    std::uint64_t records = 0;
+                    const bool success = adapter.FileIoStop(&records, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->coverage.covered = records;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for fileio.stop on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to stop the file-I/O trace" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "records", Number(operation->coverage.covered));
                     response = AGENT_MakeJsonRpcResult(parsed.id, result);
                 }
             }
