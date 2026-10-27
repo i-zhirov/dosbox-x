@@ -332,6 +332,88 @@ def start_game_emulator(dosboxx: str, game_dir: Path, work_dir: Path):
     return child, client
 
 
+class PipeProcess:
+    """Run the emulator with no terminal, so the debugger must run headless.
+
+    The standard streams are pipes, so isatty() is false for all three.
+    """
+
+    def __init__(self, argv: list[str], cwd: Path,
+                 env: dict[str, str] | None = None) -> None:
+        self.process = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self._output: list[bytes] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
+
+    def _drain(self) -> None:
+        assert self.process.stdout is not None
+        try:
+            while not self._stop.is_set():
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                self._output.append(chunk)
+        except OSError:
+            pass
+
+    def text(self) -> str:
+        return ANSI_RE.sub("", b"".join(self._output).decode("utf-8", "replace"))
+
+    def wait_for(self, marker: str, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if marker in self.text():
+                return True
+            if self.process.poll() is not None:
+                return False
+            time.sleep(0.3)
+        return False
+
+    def close(self) -> None:
+        self._stop.set()
+        if self.process.poll() is None:
+            self.process.kill()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+
+
+def start_headless_emulator(dosboxx: str, work_dir: Path, memsize: int = 16,
+                            mcp_server: bool = True):
+    """Start the emulator with no terminal and return the child and the client.
+
+    With `mcp_server` set the debugger runs headless.  Without it the debugger
+    reports the terminal guard.
+    """
+    client = McpClient() if mcp_server else None
+    work_dir = work_dir.resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    config = work_dir / "headless.conf"
+    build_test_config(config, client.port if client is not None else 0, memsize)
+    env = dict(os.environ)
+    env["SDL_VIDEODRIVER"] = "dummy"
+    env["SDL_AUDIODRIVER"] = "dummy"
+    child = PipeProcess(
+        [dosboxx, "-nogui", "-break-start", "-conf", str(config)],
+        work_dir,
+        env,
+    )
+    if client is not None:
+        client.accept()
+    return child, client
+
+
 def start_emulator(dosboxx: str, work_dir: Path, memsize: int = 16):
     """Start the emulator with the debugger and the control server, and return
     the child and the connected client."""

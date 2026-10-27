@@ -186,6 +186,7 @@ int debugrunmode=0;
 bool runnormal=false;
 bool inhibit_int_breakpoint=false;
 const char *debug_stop_reason=nullptr;
+bool debug_headless=false;
 
 void DEBUG_DrawInput(void) {
     DrawInput();
@@ -5939,6 +5940,13 @@ Bitu DEBUG_Loop(void) {
     if (DOSBOX_GetLoop() != DEBUG_Loop)
         return 0;
 
+    if (debug_headless) {
+        /* The commands arrive through the control channel, and the ncurses
+         * interface does not draw. */
+        SDL_Delay(1);
+        return 0;
+    }
+
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -6086,12 +6094,18 @@ void DEBUG_Enable_Handler(bool pressed) {
 	    allow = false;
 
     if (!allow) {
+        if (ControlServer_IsRunning()) {
+            /* The headless mode: the commands and the control channel work,
+             * and the ncurses interface does not draw. */
+            debug_headless = true;
+        } else {
 # if defined(MACOSX)
-	    LOG_MSG("Debugger in Mac OS X is not available unless you start DOSBox-X from a terminal or from the Terminal application");
+	        LOG_MSG("Debugger in Mac OS X is not available unless you start DOSBox-X from a terminal or from the Terminal application");
 # else
-	    LOG_MSG("Debugger is not available unless you start DOSBox-X from a terminal");
+	        LOG_MSG("Debugger is not available unless you start DOSBox-X from a terminal");
 # endif
-	    return;
+	        return;
+        }
     }
 #endif
 
@@ -6107,10 +6121,12 @@ void DEBUG_Enable_Handler(bool pressed) {
     debug_running=false;
     check_rescroll=true;
     DrawRegistersUpdateOld();
-    DEBUG_SetupConsole();
-    DEBUG_FlushInput();
+    if (!debug_headless) {
+        DEBUG_SetupConsole();
+        DEBUG_FlushInput();
+    }
 	SetCodeWinStart();
-	DEBUG_DrawScreen();
+	if (!debug_headless) DEBUG_DrawScreen();
 	DOSBOX_SetLoop(&DEBUG_Loop);
 	mainMenu.get_item("mapper_debugger").check(true).refresh_item(mainMenu);
     if(!CPU_IsDynamicCore()) warn_dynamic = false;
