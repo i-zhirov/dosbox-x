@@ -1189,6 +1189,7 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
 				// Ignore it once ?
 				// Found
+				lastTriggered = bp;
 				if (bp->GetOnce()) {
 					// delete it, if it should only be used once
 					(BPoints.erase)(i);
@@ -6878,6 +6879,8 @@ void DEBUG_SetupConsole(void) {
 }
 
 void DEBUG_ShutDown(Section * /*sec*/) {
+	// The guest exit is the last stop.
+	ControlServer_NotifyStop("exit",DEBUG_CurrentLinearAddress(),0xFFFFFFFFu,true);
 	TIMER_DelTickHandler(ControlServer_Poll);
 	ControlServer_Stop();
 
@@ -7370,6 +7373,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 			cpuLogFile.close();
 			DEBUG_ShowMsg("DEBUG: cpu log LOGCPU.TXT created\n");
 			cpuLog = false;
+			debug_stop_reason = "log_end";
 			DEBUG_EnableDebugger();
 			return true;
 		}
@@ -7408,6 +7412,9 @@ void DEBUG_StopLog(void) {
         cpuLogFile.close();
         DEBUG_ShowMsg("DEBUG: cpu log LOGCPU.TXT stopped\n");
         cpuLog = false;
+        // A log that stops at the BIOS POST is a stop too.
+        debug_stop_reason = "log_end";
+        DEBUG_EnableDebugger();
     }
 }
 

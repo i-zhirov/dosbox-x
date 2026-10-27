@@ -168,7 +168,10 @@ class McpClient:
                     return store.pop(index)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            frame = self.read_frame()
+            try:
+                frame = self.read_frame()
+            except ConnectionError:
+                return None
             if frame.identifier == "event":
                 self.events.append(frame)
             if predicate(frame):
@@ -286,6 +289,47 @@ class PtyProcess:
             os.close(self.master)
         except OSError:
             pass
+
+
+def build_game_config(game_dir: Path, target: Path, port: int) -> None:
+    """Write a probe config from the game config with the control port set."""
+    text = (game_dir / "dosboxScreamer.conf").read_text()
+    text = text.replace("fullscreen=true", "fullscreen=false")
+    text = text.replace("output=opengl", "output=surface")
+    text = text.replace("[dosbox]\n", f"[dosbox]\nmcp_server={port}\n", 1)
+    target.write_text(text)
+
+
+def start_game_emulator(dosboxx: str, game_dir: Path, work_dir: Path):
+    """Start the emulator with the game and the debugger, and return the
+    child and the connected client."""
+    import shutil
+
+    client = McpClient()
+    work_dir = work_dir.resolve()
+    run_dir = work_dir / "run"
+    game_copy = run_dir / "game"
+    if game_copy.exists():
+        shutil.rmtree(game_copy)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(["cp", "-cR", str(game_dir), str(game_copy)],
+                            capture_output=True)
+    if result.returncode != 0:
+        subprocess.run(["cp", "-R", str(game_dir), str(game_copy)], check=True)
+    config = work_dir / "probe.conf"
+    build_game_config(game_dir, config, client.port)
+    env = dict(os.environ)
+    env["SDL_VIDEODRIVER"] = "dummy"
+    env["SDL_AUDIODRIVER"] = "dummy"
+    env["TERM"] = "xterm-256color"
+    child = PtyProcess(
+        [dosboxx, "-nogui", "-break-start", "-conf", "../probe.conf",
+         "-conf", "game/dosboxScreamer_single.conf"],
+        run_dir,
+        env,
+    )
+    client.accept()
+    return child, client
 
 
 def start_emulator(dosboxx: str, work_dir: Path, memsize: int = 16):

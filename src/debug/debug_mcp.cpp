@@ -491,6 +491,8 @@ void ThreadMain()
         }
     }
 
+    // Send the queued messages, then name the close reason.
+    FlushOutgoing();
     CloseConnection("stop");
 }
 
