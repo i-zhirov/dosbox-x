@@ -157,6 +157,8 @@ class Breakpoint:
     address: MemoryAddress
     once: bool
     enabled: bool = True
+    condition: str | None = None
+    resolved: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)

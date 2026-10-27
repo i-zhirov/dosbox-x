@@ -63,6 +63,7 @@ enum class StepMode {
 
 enum class BreakpointKind {
     Execution,
+    ExecutionSelector,
     MemoryChange
 };
 
@@ -71,6 +72,8 @@ struct NativeBreakpoint {
     BreakpointKind kind = BreakpointKind::Execution;
     MemoryAddress address;
     bool once = false;
+    std::uint64_t linear_address = 0;
+    std::uint64_t physical_address = 0;
 };
 
 class DebuggerAdapter {
@@ -87,6 +90,7 @@ public:
                             const std::string& workdir,
                             std::string* error) const;
     bool GetRegisters(RegisterSnapshot* registers, std::string* error) const;
+    bool SetRegisters(const RegisterSnapshot& registers, std::string* error) const;
     bool Step(StepMode mode, bool* continued, std::string* error) const;
     bool ReadMemory(const MemoryAddress& address,
                     std::size_t length,
@@ -100,6 +104,8 @@ public:
                      std::string* error) const;
     bool CreateBreakpoint(BreakpointKind kind,
                           const MemoryAddress& address,
+                          const std::string& condition,
+                          std::uint32_t hit_limit,
                           bool once,
                           NativeBreakpoint* breakpoint,
                           MemoryAccessError* access_error,

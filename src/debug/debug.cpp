@@ -1789,6 +1789,90 @@ bool DEBUG_AgentCreateMemoryBreakpoint(uint16_t seg,
 #endif
 }
 
+bool DEBUG_AgentCreateLinearBreakpoint(uint32_t linear, bool once, uintptr_t* handle)
+{
+	if (handle == nullptr) return false;
+	CBreakpoint* breakpoint = CBreakpoint::AddCodeBreakpoint(linear,once);
+	if (breakpoint == nullptr) return false;
+	*handle = reinterpret_cast<uintptr_t>(breakpoint);
+	return true;
+}
+
+bool DEBUG_AgentCreateSelectorBreakpoint(uint16_t seg, uint32_t off, bool once, uintptr_t* handle)
+{
+	if (handle == nullptr) return false;
+	CBreakpoint* breakpoint = CBreakpoint::AddSelectorBreakpoint(seg,off,once);
+	if (breakpoint == nullptr) return false;
+	*handle = reinterpret_cast<uintptr_t>(breakpoint);
+	return true;
+}
+
+bool DEBUG_AgentSetBreakpointCondition(uintptr_t handle, const char* condition)
+{
+	CBreakpoint* breakpoint = reinterpret_cast<CBreakpoint*>(handle);
+	if (breakpoint == nullptr) return false;
+	if (condition == nullptr || *condition == 0) return true;
+	/* The agent grammar is the grammar of the IF option. */
+	std::string text = std::string("IF ") + condition;
+	for (auto &c : text) c = toupper(c);
+	char *found = &text[0];
+	CDbgCondition parsed;
+	uint32_t hit_limit = 0;
+	bool once = false;
+	if (!ParseBreakpointOptions(found,parsed,hit_limit,once)) return false;
+	breakpoint->SetCondition(parsed);
+	return true;
+}
+
+bool DEBUG_AgentSetBreakpointHitLimit(uintptr_t handle, uint32_t limit)
+{
+	CBreakpoint* breakpoint = reinterpret_cast<CBreakpoint*>(handle);
+	if (breakpoint == nullptr) return false;
+	breakpoint->SetHitLimit(limit);
+	return true;
+}
+
+bool DEBUG_AgentResolveAddress(bool linear, uint16_t seg, uint32_t off, uint64_t* linear_address, uint64_t* physical_address)
+{
+	DbgAddress address;
+	if (linear) {
+		address.space = DBG_SPACE_LINEAR;
+		address.selector = 0;
+		address.offset = off;
+	} else {
+		address.space = DBG_SPACE_SEGMENTED;
+		address.selector = seg;
+		address.offset = off;
+	}
+	DbgResolved resolved = ResolveDbgAddress(address);
+	if (!resolved.valid) return false;
+	if (linear_address != nullptr) *linear_address = resolved.linear;
+	if (physical_address != nullptr) *physical_address = resolved.physical;
+	return true;
+}
+
+bool DEBUG_AgentSetRegisters(const DEBUG_AgentRegisterValues* registers)
+{
+	if (registers == nullptr) return false;
+	reg_eax = registers->eax;
+	reg_ebx = registers->ebx;
+	reg_ecx = registers->ecx;
+	reg_edx = registers->edx;
+	reg_esi = registers->esi;
+	reg_edi = registers->edi;
+	reg_ebp = registers->ebp;
+	reg_esp = registers->esp;
+	SegSet16(cs,registers->cs);
+	SegSet16(ds,registers->ds);
+	SegSet16(es,registers->es);
+	SegSet16(fs,registers->fs);
+	SegSet16(gs,registers->gs);
+	SegSet16(ss,registers->ss);
+	reg_eip = registers->instruction_pointer;
+	CPU_SetFlags(registers->flags,FMASK_ALL);
+	return true;
+}
+
 bool DEBUG_AgentDeleteBreakpoint(uintptr_t handle)
 {
 	return CBreakpoint::DeleteBreakpoint(reinterpret_cast<CBreakpoint*>(handle));

@@ -377,6 +377,41 @@ bool DebuggerAdapter::GetRegisters(RegisterSnapshot* registers, std::string* err
 #endif
 }
 
+bool DebuggerAdapter::SetRegisters(const RegisterSnapshot& registers, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    DEBUG_AgentRegisterValues values;
+    values.eax = registers.eax;
+    values.ebx = registers.ebx;
+    values.ecx = registers.ecx;
+    values.edx = registers.edx;
+    values.esi = registers.esi;
+    values.edi = registers.edi;
+    values.ebp = registers.ebp;
+    values.esp = registers.esp;
+    values.cs = registers.cs;
+    values.ds = registers.ds;
+    values.es = registers.es;
+    values.fs = registers.fs;
+    values.gs = registers.gs;
+    values.ss = registers.ss;
+    values.instruction_pointer = registers.instruction_pointer;
+    values.flags = registers.flags;
+    if (!DEBUG_AgentSetRegisters(&values)) {
+        if (error != NULL)
+            *error = "Debugger rejected the register values";
+        return false;
+    }
+    return true;
+#else
+    (void)registers;
+    return false;
+#endif
+}
+
 bool DebuggerAdapter::Step(const StepMode mode, bool* continued, std::string* error) const
 {
     if (!RequireAvailable(error) || !RequireEmulationThread(error) || continued == NULL)
@@ -463,6 +498,8 @@ bool DebuggerAdapter::WriteMemory(const MemoryAddress& address,
 
 bool DebuggerAdapter::CreateBreakpoint(const BreakpointKind kind,
                                        const MemoryAddress& address,
+                                       const std::string& condition,
+                                       const std::uint32_t hit_limit,
                                        const bool once,
                                        NativeBreakpoint* breakpoint,
                                        MemoryAccessError* access_error,
@@ -482,14 +519,32 @@ bool DebuggerAdapter::CreateBreakpoint(const BreakpointKind kind,
 
     std::uintptr_t handle = 0;
     if (kind == BreakpointKind::Execution) {
-        if (address.space != MemorySpace::Segmented) {
+        if (address.space == MemorySpace::Linear) {
+            if (!DEBUG_AgentCreateLinearBreakpoint(address.offset, once, &handle)) {
+                if (error != NULL)
+                    *error = "Debugger rejected the linear execution breakpoint";
+                return false;
+            }
+        } else if (address.space == MemorySpace::Segmented) {
+            if (!DEBUG_AgentCreateExecutionBreakpoint(address.segment, address.offset, once, &handle)) {
+                if (error != NULL)
+                    *error = "Debugger rejected the execution breakpoint";
+                return false;
+            }
+        } else {
             if (error != NULL)
-                *error = "Execution breakpoints currently require segmented addresses";
+                *error = "Execution breakpoints require a segmented or a linear address";
             return false;
         }
-        if (!DEBUG_AgentCreateExecutionBreakpoint(address.segment, address.offset, once, &handle)) {
+    } else if (kind == BreakpointKind::ExecutionSelector) {
+        if (address.space != MemorySpace::Segmented) {
             if (error != NULL)
-                *error = "Debugger rejected the execution breakpoint";
+                *error = "A selector execution breakpoint requires a segmented address";
+            return false;
+        }
+        if (!DEBUG_AgentCreateSelectorBreakpoint(address.segment, address.offset, once, &handle)) {
+            if (error != NULL)
+                *error = "Debugger rejected the selector execution breakpoint";
             return false;
         }
     } else {
@@ -519,14 +574,36 @@ bool DebuggerAdapter::CreateBreakpoint(const BreakpointKind kind,
 #endif
     }
 
+    if (!condition.empty() && !DEBUG_AgentSetBreakpointCondition(handle, condition.c_str())) {
+        DEBUG_AgentDeleteBreakpoint(handle);
+        if (error != NULL)
+            *error = "Debugger rejected the breakpoint condition";
+        return false;
+    }
+    if (hit_limit > 0 && !DEBUG_AgentSetBreakpointHitLimit(handle, hit_limit)) {
+        DEBUG_AgentDeleteBreakpoint(handle);
+        if (error != NULL)
+            *error = "Debugger rejected the breakpoint hit limit";
+        return false;
+    }
+
     breakpoint->handle = handle;
     breakpoint->kind = kind;
     breakpoint->address = address;
     breakpoint->once = once;
+    std::uint64_t linear_address = 0;
+    std::uint64_t physical_address = 0;
+    if (DEBUG_AgentResolveAddress(address.space == MemorySpace::Linear, address.segment, address.offset,
+                                    &linear_address, &physical_address)) {
+        breakpoint->linear_address = linear_address;
+        breakpoint->physical_address = physical_address;
+    }
     return true;
 #else
     (void)kind;
     (void)address;
+    (void)condition;
+    (void)hit_limit;
     (void)once;
     (void)breakpoint;
     (void)access_error;

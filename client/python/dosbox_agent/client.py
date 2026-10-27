@@ -386,18 +386,34 @@ class AgentClient:
         return self.create_breakpoint(session_id, "execution", MemoryAddress.segmented(segment, offset), once=once,
                                       request_id=request_id)
 
-    def create_breakpoint(self, session_id: str, kind: str, address: MemoryAddress, *, once: bool = False,
+    def create_breakpoint(self, session_id: str, kind: str, address: MemoryAddress, *, condition: str | None = None,
+                          hit_count: int | None = None, once: bool = False,
                           request_id: str | None = None) -> Breakpoint:
-        if kind not in ("execution", "memory_change"):
-            raise ValueError("kind must be execution or memory_change")
-        result = self.call("breakpoints.create", {
+        if kind not in ("execution", "execution_linear", "execution_selector", "memory_change"):
+            raise ValueError("kind must be execution, execution_linear, execution_selector, or memory_change")
+        params: dict[str, Any] = {
             "session_id": session_id,
             "kind": kind,
             "address": address.to_rpc(),
             "once": once,
-        }, request_id)
+        }
+        if condition is not None:
+            params["condition"] = condition
+        if hit_count is not None:
+            params["hit_count"] = hit_count
+        result = self.call("breakpoints.create", params, request_id)
+        resolved = result.get("resolved")
         return Breakpoint(_string(result, "breakpoint_id"), _string(result, "kind"),
-                          MemoryAddress.from_rpc(_object(result, "address")), bool(result.get("once")), True)
+                          MemoryAddress.from_rpc(_object(result, "address")), bool(result.get("once")), True,
+                          result.get("condition") if isinstance(result.get("condition"), str) else None,
+                          resolved if isinstance(resolved, Mapping) else None)
+
+    def set_registers(self, session_id: str, registers: Mapping[str, int], request_id: str | None = None) -> int:
+        result = self.call("state.set_registers", {
+            "session_id": session_id,
+            "registers": {str(name): int(value) for name, value in registers.items()},
+        }, request_id)
+        return _integer(result, "state_revision")
 
     def list_breakpoints(self, session_id: str, request_id: str | None = None) -> tuple[Breakpoint, ...]:
         result = self.call("breakpoints.list", {"session_id": session_id}, request_id)

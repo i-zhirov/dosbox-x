@@ -55,7 +55,7 @@ class AgentSocketTests(unittest.TestCase):
         env["SDL_AUDIODRIVER"] = "dummy"
         env["TERM"] = "xterm-256color"
         self.child = PtyProcess(
-            [DOSBOXX, "-nogui", "-agent-config", str(self.config_path)],
+            [DOSBOXX, "-nogui", "-nopromptfolder", "-agent-config", str(self.config_path)],
             self.work_dir,
             env,
         )

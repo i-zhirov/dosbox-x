@@ -73,6 +73,7 @@ bool DEBUG_IsStopped();
 //
 uint64_t DEBUG_CurrentLinearAddress();
 
+
 // Capture hook used by DEBUG_ShowMsg while a control request is running.
 bool DEBUG_MCP_IsCapturingOutput();
 void DEBUG_MCP_CaptureMessage(const char* message);

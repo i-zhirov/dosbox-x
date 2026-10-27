@@ -37,6 +37,22 @@ bool DEBUG_AgentCanStartTarget(void);
 uint64_t DEBUG_AgentEntryBreakpointSequence(void);
 bool DEBUG_AgentCreateExecutionBreakpoint(uint16_t seg, uint32_t off, bool once, uintptr_t* handle);
 bool DEBUG_AgentCreateMemoryBreakpoint(uint16_t seg, uint32_t off, bool protected_mode, bool linear, uintptr_t* handle);
+bool DEBUG_AgentCreateLinearBreakpoint(uint32_t linear, bool once, uintptr_t* handle);
+bool DEBUG_AgentCreateSelectorBreakpoint(uint16_t seg, uint32_t off, bool once, uintptr_t* handle);
+bool DEBUG_AgentSetBreakpointCondition(uintptr_t handle, const char* condition);
+bool DEBUG_AgentSetBreakpointHitLimit(uintptr_t handle, uint32_t limit);
+bool DEBUG_AgentResolveAddress(bool linear, uint16_t seg, uint32_t off, uint64_t* linear_address, uint64_t* physical_address);
+
+// The register values of a state.set_registers request.
+struct DEBUG_AgentRegisterValues {
+    uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+    uint32_t esi = 0, edi = 0, ebp = 0, esp = 0;
+    uint16_t cs = 0, ds = 0, es = 0, fs = 0, gs = 0, ss = 0;
+    uint32_t instruction_pointer = 0;
+    uint32_t flags = 0;
+};
+
+bool DEBUG_AgentSetRegisters(const DEBUG_AgentRegisterValues* registers);
 bool DEBUG_AgentDeleteBreakpoint(uintptr_t handle);
 uintptr_t DEBUG_AgentConsumeLastBreakpoint(void);
 void DEBUG_AgentClearLastBreakpoint(void);

@@ -323,7 +323,7 @@ def start_game_emulator(dosboxx: str, game_dir: Path, work_dir: Path):
     env["SDL_AUDIODRIVER"] = "dummy"
     env["TERM"] = "xterm-256color"
     child = PtyProcess(
-        [dosboxx, "-nogui", "-break-start", "-conf", "../probe.conf",
+        [dosboxx, "-nogui", "-nopromptfolder", "-break-start", "-conf", "../probe.conf",
          "-conf", "game/dosboxScreamer_single.conf"],
         run_dir,
         env,
@@ -405,7 +405,7 @@ def start_headless_emulator(dosboxx: str, work_dir: Path, memsize: int = 16,
     env["SDL_VIDEODRIVER"] = "dummy"
     env["SDL_AUDIODRIVER"] = "dummy"
     child = PipeProcess(
-        [dosboxx, "-nogui", "-break-start", "-conf", str(config)],
+        [dosboxx, "-nogui", "-nopromptfolder", "-break-start", "-conf", str(config)],
         work_dir,
         env,
     )
@@ -427,7 +427,7 @@ def start_emulator(dosboxx: str, work_dir: Path, memsize: int = 16):
     env["SDL_AUDIODRIVER"] = "dummy"
     env["TERM"] = "xterm-256color"
     child = PtyProcess(
-        [dosboxx, "-nogui", "-break-start", "-conf", str(config)],
+        [dosboxx, "-nogui", "-nopromptfolder", "-break-start", "-conf", str(config)],
         work_dir,
         env,
     )
