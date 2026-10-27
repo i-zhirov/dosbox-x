@@ -1,4 +1,4 @@
-from .client import AgentClient
+from .client import AgentClient, load_config
 from .errors import (
     AddressNotMappedError,
     AgentConnectionError,
@@ -39,7 +39,7 @@ from .models import (
 )
 
 __all__ = [
-    "AddressNotMappedError", "AgentClient", "AgentConfig", "AgentConnectionError", "AgentError",
+    "AddressNotMappedError", "AgentClient", "AgentConfig", "load_config", "AgentConnectionError", "AgentError",
     "AgentProtocolError", "AgentRpcError", "Breakpoint", "BreakpointNotFoundError",
     "CapabilityUnavailableError", "CommandRejectedError", "CursorExpiredError", "DiagnosticCommandResult",
     "InvalidBinaryLengthError", "MemoryAddress", "MemoryPreconditionFailedError", "MemoryRead", "MemoryWrite",

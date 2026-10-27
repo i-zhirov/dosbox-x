@@ -13,6 +13,14 @@
 #include <windows.h>
 #include <sddl.h>
 #pragma comment(lib, "Advapi32.lib")
+#else
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #endif
 
 namespace dosbox_agent {
@@ -293,6 +301,9 @@ private:
 
 class UnixSocketTransport final : public IRpcTransport {
 public:
+    UnixSocketTransport() : impl(new Impl()) {}
+    ~UnixSocketTransport() override { Stop(); }
+
     const char* Name() const override { return "unix_socket"; }
 
     bool ValidateConfiguration(const AgentConfig& config,
@@ -306,16 +317,247 @@ public:
         return true;
     }
 
-    bool Start(const AgentConfig&,
-               RequestHandler,
+    bool Start(const AgentConfig& config,
+               RequestHandler handler,
                std::string* error) override
     {
+        if (!ValidateConfiguration(config, error) || !handler)
+            return false;
+
+#ifndef WIN32
+        std::unique_lock<std::mutex> lock(impl->mutex);
+        if (impl->listener.joinable()) {
+            if (error != NULL)
+                *error = "Unix socket transport is already running";
+            return false;
+        }
+
+        impl->config = config;
+        impl->handler = handler;
+        impl->stopping = false;
+        impl->ready = false;
+        impl->start_succeeded = false;
+        impl->start_error.clear();
+        impl->listener = std::thread(&UnixSocketTransport::Run, this);
+        impl->ready_condition.wait(lock, [this]() { return impl->ready; });
+        if (impl->start_succeeded)
+            return true;
+
+        const std::string start_error = impl->start_error;
+        lock.unlock();
+        impl->listener.join();
         if (error != NULL)
-            *error = "Unix socket transport is outside the Windows v1 scope";
+            *error = start_error;
         return false;
+#else
+        if (error != NULL)
+            *error = "Unix sockets are unavailable on this platform";
+        return false;
+#endif
     }
 
-    void Stop() override {}
+    void Stop() override
+    {
+#ifndef WIN32
+        std::thread listener;
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            if (!impl->listener.joinable())
+                return;
+            impl->stopping = true;
+            if (impl->client_fd >= 0) {
+                shutdown(impl->client_fd, SHUT_RDWR);
+                close(impl->client_fd);
+                impl->client_fd = -1;
+            }
+            if (impl->server_fd >= 0) {
+                shutdown(impl->server_fd, SHUT_RDWR);
+                close(impl->server_fd);
+                impl->server_fd = -1;
+            }
+            listener.swap(impl->listener);
+        }
+        listener.join();
+#endif
+    }
+
+private:
+    class Impl {
+    public:
+        std::mutex mutex;
+        std::condition_variable ready_condition;
+        AgentConfig config;
+        RequestHandler handler;
+        std::thread listener;
+        bool stopping = false;
+        bool ready = false;
+        bool start_succeeded = false;
+        std::string start_error;
+        int server_fd = -1;
+        int client_fd = -1;
+    };
+
+    std::unique_ptr<Impl> impl;
+
+#ifndef WIN32
+    static bool WriteAll(const int fd, const std::string& message)
+    {
+        std::size_t offset = 0;
+        while (offset < message.size()) {
+            const ssize_t written = write(fd, message.data() + offset, message.size() - offset);
+            if (written <= 0) {
+                if (written < 0 && errno == EINTR)
+                    continue;
+                return false;
+            }
+            offset += static_cast<std::size_t>(written);
+        }
+        return true;
+    }
+
+    bool ServeClient(const int fd)
+    {
+        std::string pending;
+        char buffer[4096];
+        for (;;) {
+            const ssize_t read_bytes = read(fd, buffer, sizeof(buffer));
+            if (read_bytes <= 0) {
+                if (read_bytes < 0 && errno == EINTR)
+                    continue;
+                return false;
+            }
+            pending.append(buffer, static_cast<std::size_t>(read_bytes));
+
+            for (;;) {
+                const std::string::size_type line_end = pending.find('\n');
+                if (line_end == std::string::npos) {
+                    if (pending.size() > impl->config.max_message_bytes) {
+                        const std::string response = impl->handler(std::string(impl->config.max_message_bytes + 1, 'x')) + "\n";
+                        WriteAll(fd, response);
+                        return false;
+                    }
+                    break;
+                }
+
+                std::string request = pending.substr(0, line_end);
+                pending.erase(0, line_end + 1);
+                if (!request.empty() && request[request.size() - 1] == '\r')
+                    request.erase(request.size() - 1);
+                if (request.size() > impl->config.max_message_bytes) {
+                    const std::string response = impl->handler(std::string(impl->config.max_message_bytes + 1, 'x')) + "\n";
+                    WriteAll(fd, response);
+                    return false;
+                }
+                if (!WriteAll(fd, impl->handler(request) + "\n"))
+                    return false;
+            }
+
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            if (impl->stopping)
+                return false;
+        }
+    }
+
+    void Run()
+    {
+        struct sockaddr_un address;
+        memset(&address, 0, sizeof(address));
+        address.sun_family = AF_UNIX;
+        if (impl->config.endpoint.size() >= sizeof(address.sun_path)) {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->start_error = "Unix socket endpoint path is too long";
+            impl->ready = true;
+            impl->ready_condition.notify_all();
+            return;
+        }
+        snprintf(address.sun_path, sizeof(address.sun_path), "%s", impl->config.endpoint.c_str());
+
+        // Remove a stale socket path from a previous run.
+        unlink(address.sun_path);
+
+        const int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (server_fd < 0) {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->start_error = "Unable to create the Unix socket";
+            impl->ready = true;
+            impl->ready_condition.notify_all();
+            return;
+        }
+
+        if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 ||
+                chmod(address.sun_path, 0600) < 0) {
+            close(server_fd);
+            unlink(address.sun_path);
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->start_error = "Unable to bind the Unix socket endpoint";
+            impl->ready = true;
+            impl->ready_condition.notify_all();
+            return;
+        }
+
+        if (listen(server_fd, 1) < 0) {
+            close(server_fd);
+            unlink(address.sun_path);
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->start_error = "Unable to listen on the Unix socket endpoint";
+            impl->ready = true;
+            impl->ready_condition.notify_all();
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->server_fd = server_fd;
+            impl->start_succeeded = true;
+            impl->ready = true;
+            impl->ready_condition.notify_all();
+            if (impl->stopping) {
+                close(server_fd);
+                unlink(address.sun_path);
+                impl->server_fd = -1;
+                return;
+            }
+        }
+
+        // Accept one client at a time and serve it.
+        for (;;) {
+            const int client_fd = accept(server_fd, NULL, NULL);
+            if (client_fd < 0) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+
+            bool stopping = false;
+            {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->client_fd = client_fd;
+                stopping = impl->stopping;
+            }
+            if (stopping) {
+                close(client_fd);
+                break;
+            }
+
+            ServeClient(client_fd);
+            close(client_fd);
+
+            {
+                std::lock_guard<std::mutex> lock(impl->mutex);
+                impl->client_fd = -1;
+                if (impl->stopping)
+                    break;
+            }
+        }
+
+        close(server_fd);
+        unlink(address.sun_path);
+        {
+            std::lock_guard<std::mutex> lock(impl->mutex);
+            impl->server_fd = -1;
+        }
+    }
+#endif
 };
 
 } // namespace
