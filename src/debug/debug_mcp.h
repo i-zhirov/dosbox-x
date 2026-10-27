@@ -51,6 +51,28 @@ void ControlServer_Poll();
 // Execute one existing debugger command through ParseCommand().
 bool DEBUG_ExecuteCommand(const char* command);
 
+//
+// Notify the control server of a stop: record the stop, complete a pending
+// WAIT request, and send the STOP event frame.
+//
+void ControlServer_NotifyStop(const char* reason, uint64_t address,
+                             uint32_t breakpoint_id, bool condition_result);
+
+//
+// Returns true when the control server runs, for the headless mode.
+//
+bool ControlServer_IsRunning();
+
+//
+// Returns true when the debugger is stopped and not running.
+//
+bool DEBUG_IsStopped();
+
+//
+// The linear address of the current instruction, for a stop record.
+//
+uint64_t DEBUG_CurrentLinearAddress();
+
 // Capture hook used by DEBUG_ShowMsg while a control request is running.
 bool DEBUG_MCP_IsCapturingOutput();
 void DEBUG_MCP_CaptureMessage(const char* message);

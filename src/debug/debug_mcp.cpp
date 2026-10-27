@@ -18,6 +18,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -55,6 +56,24 @@ std::mutex g_capture_mutex;
 bool g_capture_active = false;
 size_t g_capture_discarded = 0;
 std::vector<std::string> g_capture_lines;
+
+// The last stop, for a WAIT request that arrives while the debugger is stopped.
+struct StopRecord {
+    std::string reason;
+    uint64_t address = 0;
+    uint32_t breakpoint_id = 0;
+    bool condition_result = false;
+    bool valid = false;
+};
+
+std::mutex g_stop_mutex;
+StopRecord g_last_stop;
+
+// A pending WAIT request.
+std::mutex g_wait_mutex;
+bool g_wait_pending = false;
+std::string g_wait_id;
+std::chrono::steady_clock::time_point g_wait_deadline;
 
 //
 // All socket operations happen ONLY in the I/O thread.
@@ -475,6 +494,35 @@ void ThreadMain()
     CloseConnection("stop");
 }
 
+std::string StopRecordData(void)
+{
+    std::lock_guard<std::mutex> lock(g_stop_mutex);
+
+    if (!g_last_stop.valid) {
+        g_last_stop.reason = "break";
+        g_last_stop.address = DEBUG_CurrentLinearAddress();
+        g_last_stop.breakpoint_id = 0xFFFFFFFFu;
+        g_last_stop.condition_result = true;
+        g_last_stop.valid = true;
+    }
+
+    char data[128];
+    std::snprintf(data,
+                  sizeof(data),
+                  "%s %08X %u %u",
+                  g_last_stop.reason.c_str(),
+                  static_cast<unsigned>(g_last_stop.address),
+                  static_cast<unsigned>(g_last_stop.breakpoint_id),
+                  g_last_stop.condition_result ? 1u : 0u);
+
+    return data;
+}
+
+std::string StopRecordLine(void)
+{
+    return std::string("STOP ") + StopRecordData();
+}
+
 bool ParseControlRequest(const std::string& line,
                          ControlRequest& request,
                          std::string& error)
@@ -516,7 +564,8 @@ bool ParseControlRequest(const std::string& line,
 
     if (request.command != "PING" &&
             request.command != "BREAK" &&
-            request.command != "EXEC") {
+            request.command != "EXEC" &&
+            request.command != "WAIT") {
         error = "unknown request command";
         return false;
     }
@@ -524,6 +573,21 @@ bool ParseControlRequest(const std::string& line,
     if (request.command == "EXEC" && request.payload.empty()) {
         error = "missing debugger command";
         return false;
+    }
+
+    if (request.command == "WAIT") {
+        if (request.payload.empty()) {
+            error = "missing wait timeout";
+            return false;
+        }
+
+        char* end = nullptr;
+        const long timeout = std::strtol(request.payload.c_str(), &end, 10);
+
+        if (end == request.payload.c_str() || *end != '\0' || timeout < 0) {
+            error = "the wait timeout is not a non-negative number";
+            return false;
+        }
     }
 
     return true;
@@ -592,6 +656,26 @@ void ProcessControlCommand(const std::string& line)
 
     if (request.command == "PING") {
         SendResponse(request.id, true, {"PONG"});
+        return;
+    }
+
+    if (request.command == "WAIT") {
+        const long timeout = std::strtol(request.payload.c_str(), nullptr, 10);
+
+        // When the debugger is stopped, the reply arrives at once.
+        if (DEBUG_IsStopped()) {
+            SendResponse(request.id, true, {StopRecordLine()});
+            return;
+        }
+
+        // Otherwise arm the wait, and the stop or the deadline completes it.
+        {
+            std::lock_guard<std::mutex> lock(g_wait_mutex);
+            g_wait_pending = true;
+            g_wait_id = request.id;
+            g_wait_deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(timeout);
+        }
         return;
     }
 
@@ -695,6 +779,41 @@ void ControlServer_Send(std::string message)
     g_outgoing.emplace_back(std::move(message));
 }
 
+void ControlServer_NotifyStop(const char* reason, const uint64_t address,
+                             const uint32_t breakpoint_id,
+                             const bool condition_result)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_stop_mutex);
+        g_last_stop.reason = reason ? reason : "break";
+        g_last_stop.address = address;
+        g_last_stop.breakpoint_id = breakpoint_id;
+        g_last_stop.condition_result = condition_result;
+        g_last_stop.valid = true;
+    }
+
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lock(g_wait_mutex);
+        if (g_wait_pending) {
+            id = g_wait_id;
+            g_wait_pending = false;
+        }
+    }
+
+    // A waiting client reads the stop record.
+    if (!id.empty())
+        SendResponse(id, true, {StopRecordLine()});
+
+    // Every stop delivers the event frame.
+    ControlServer_SendEvent("STOP", StopRecordData());
+}
+
+bool ControlServer_IsRunning()
+{
+    return g_running.load();
+}
+
 void ControlServer_SendEvent(
         const std::string& event,
         const std::string& data)
@@ -705,8 +824,27 @@ void ControlServer_SendEvent(
                        "\nEND event");
 }
 
+void CheckWaitTimeout(void)
+{
+    std::string id;
+
+    {
+        std::lock_guard<std::mutex> lock(g_wait_mutex);
+        if (!g_wait_pending)
+            return;
+        if (std::chrono::steady_clock::now() < g_wait_deadline)
+            return;
+        id = g_wait_id;
+        g_wait_pending = false;
+    }
+
+    SendResponse(id, true, {"TIMEOUT"});
+}
+
 void ControlServer_Poll()
 {
+    CheckWaitTimeout();
+
     std::string command;
     while (PopIncoming(command)) {
         std::fprintf(stderr,
@@ -743,6 +881,8 @@ void DEBUG_MCP_CaptureMessage(const char* message)
 void ControlServer_Start(uint16_t) {}
 void ControlServer_Stop() {}
 bool ControlServer_IsConnected() { return false; }
+void ControlServer_NotifyStop(const char*, uint64_t, uint32_t, bool) {}
+bool ControlServer_IsRunning() { return false; }
 void ControlServer_Send(std::string) {}
 void ControlServer_SendEvent(const std::string&, const std::string&) {}
 void ControlServer_Poll() {}

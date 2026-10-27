@@ -185,6 +185,7 @@ extern int debuggerrun;
 int debugrunmode=0;
 bool runnormal=false;
 bool inhibit_int_breakpoint=false;
+const char *debug_stop_reason=nullptr;
 
 void DEBUG_DrawInput(void) {
     DrawInput();
@@ -818,6 +819,7 @@ public:
 	static bool				CheckBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				CheckIntBreakpoint	(PhysPt adr, uint8_t intNr, uint16_t ahValue, uint16_t alValue);
 	static CBreakpoint*		FindPhysBreakpoint	(uint16_t seg, uint32_t off, bool once);
+	static uint32_t			GetLastTriggeredIndex(void);
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
@@ -953,6 +955,16 @@ CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
 oldData(0xCC),
 #endif
 segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false),hitLimit(0),hitCount(0) { }
+
+uint32_t CBreakpoint::GetLastTriggeredIndex(void)
+{
+	if (lastTriggered == nullptr) return 0xFFFFFFFFu;
+	uint32_t index = 0;
+	for (std::list<CBreakpoint*>::iterator i=BPoints.begin(); i!=BPoints.end(); ++i, index++) {
+		if ((*i) == lastTriggered) return index;
+	}
+	return 0xFFFFFFFFu;
+}
 
 bool CBreakpoint::CheckHitLimit(void)
 {
@@ -1611,6 +1623,7 @@ bool DEBUG_Breakpoint(void)
 	// Found. Breakpoint is valid
 //	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+	debug_stop_reason = "breakpoint";
 	return true;
 }
 
@@ -1627,6 +1640,7 @@ bool DEBUG_IntBreakpoint(uint8_t intNum)
 		CDbgPatch::DisarmAt(where);
 	}
 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+	debug_stop_reason = "breakpoint";
 	return true;
 }
 
@@ -5070,6 +5084,19 @@ bool ParseCommand(char* str) {
 	return false;
 }
 
+bool DEBUG_IsStopped(void)
+{
+	return debugging && !debug_running;
+}
+
+uint64_t DEBUG_CurrentLinearAddress(void)
+{
+	uint64_t address = (uint64_t)GetAddress(SegValue(cs),reg_eip);
+	if (address == mem_no_address)
+		address = ((uint64_t)SegValue(cs) << 4u) + (uint64_t)(reg_eip & 0xFFFFu);
+	return address;
+}
+
 bool DEBUG_ExecuteCommand(const char* command)
 {
 	if (command == NULL || *command == 0) {
@@ -6791,6 +6818,14 @@ Bitu DEBUG_EnableDebugger(void)
 {
 	exitLoop = true;
 
+	// Every stop notifies the control server once, and the specific stop
+	// paths set the reason.
+	ControlServer_NotifyStop(debug_stop_reason ? debug_stop_reason : "break",
+		DEBUG_CurrentLinearAddress(),
+		CBreakpoint::GetLastTriggeredIndex(),
+		debug_stop_reason != nullptr);
+	debug_stop_reason = nullptr;
+
 	if (!debugging || (debugging && debug_running))
 		DEBUG_Enable_Handler(true);
 
@@ -7360,6 +7395,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		return false;
 	}
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+		debug_stop_reason = "breakpoint";
 		return true;
 	}
 	return false;

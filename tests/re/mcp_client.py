@@ -101,6 +101,7 @@ class McpClient:
         self._buffer = b""
         self._next_id = 0
         self.events: list[Frame] = []
+        self.pending: list[Frame] = []
 
     def __enter__(self) -> "McpClient":
         self.accept()
@@ -148,6 +149,33 @@ class McpClient:
     def read_frame(self) -> Frame:
         return read_frame(self._read_line)
 
+    def send_request(self, command: str, payload: str = "") -> str:
+        """Send a request and return its id, without waiting for a reply."""
+        self._next_id += 1
+        request_id = str(self._next_id)
+        message = f"REQ {request_id} {command}"
+        if payload:
+            message += f" {payload}"
+        self.send_line(message)
+        return request_id
+
+    def read_until(self, predicate: Callable[[Frame], bool],
+                    timeout: float) -> Frame | None:
+        """Read frames until one matches, and keep the other frames."""
+        for store in (self.pending, self.events):
+            for index, frame in enumerate(store):
+                if predicate(frame):
+                    return store.pop(index)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            frame = self.read_frame()
+            if frame.identifier == "event":
+                self.events.append(frame)
+            if predicate(frame):
+                return frame
+            self.pending.append(frame)
+        return None
+
     def request(self, command: str, payload: str = "",
                  timeout: float | None = None) -> Response:
         self._next_id += 1
@@ -165,6 +193,8 @@ class McpClient:
                 return Response(request_id, frame.ok, frame.lines, frame.count)
             if frame.identifier == "event":
                 self.events.append(frame)
+            else:
+                self.pending.append(frame)
 
 
 def build_test_config(target: Path, port: int, memsize: int = 16) -> None:
