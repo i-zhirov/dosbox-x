@@ -251,11 +251,12 @@ static const char* MemorySpaceName(const MemorySpace space)
 static bool ParseMemoryAddress(const JsonValue& params,
                                const char* method,
                                MemoryAddress* address,
-                               std::string* error)
+                               std::string* error,
+                               const char* field = "address")
 {
-    const JsonValue* encoded = params.Find("address");
+    const JsonValue* encoded = params.Find(field);
     if (encoded == NULL || encoded->type != JsonType::Object) {
-        *error = std::string(method) + " requires address as an object";
+        *error = std::string(method) + " requires " + field + " as an object";
         return false;
     }
     const JsonValue* space = encoded->Find("space");
@@ -520,6 +521,9 @@ static bool IsKnownMethod(const std::string& method)
            method == "memory.write" ||
            method == "breakpoints.create" ||
            method == "state.set_registers" ||
+           method == "coverage.start" ||
+           method == "coverage.read" ||
+           method == "coverage.stop" ||
            method == "breakpoints.list" ||
            method == "breakpoints.delete" ||
            method == "debug.output.read" ||
@@ -572,6 +576,7 @@ public:
         MemoryAccessError access_error;
         std::vector<std::uint8_t> before;
         std::vector<std::uint8_t> after;
+        NativeCoverage coverage;
     };
 
     struct AdapterOperation {
@@ -589,6 +594,7 @@ public:
         std::vector<TraceSample> trace_samples;
         bool trace_active = false;
         std::size_t trace_event_count = 0;
+        NativeCoverage coverage;
     };
 
     struct StepOperation {
@@ -678,6 +684,9 @@ public:
                                     std::string* error) const = 0;
     virtual bool GetRegisters(RegisterSnapshot* registers, std::string* error) const = 0;
     virtual bool SetRegisters(const RegisterSnapshot& registers, std::string* error) const = 0;
+    virtual bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const = 0;
+    virtual bool CoverageRead(NativeCoverage* coverage, std::string* error) const = 0;
+    virtual bool CoverageStop(std::uint64_t* covered, std::string* error) const = 0;
     virtual bool Step(StepMode mode, bool* continued, std::string* error) const = 0;
     virtual bool ReadMemory(const MemoryAddress& address,
                             std::size_t length,
@@ -735,6 +744,9 @@ public:
     AGENT_RUNTIME_FORWARD(StartTargetAtEntry, bool StartTargetAtEntry(const std::string& command, const std::vector<std::string>& arguments, const std::string& workdir, std::string* error) const, (command, arguments, workdir, error))
     AGENT_RUNTIME_FORWARD(GetRegisters, bool GetRegisters(RegisterSnapshot* registers, std::string* error) const, (registers, error))
     AGENT_RUNTIME_FORWARD(SetRegisters, bool SetRegisters(const RegisterSnapshot& registers, std::string* error) const, (registers, error))
+    AGENT_RUNTIME_FORWARD(CoverageStart, bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const, (start, length, error))
+    AGENT_RUNTIME_FORWARD(CoverageRead, bool CoverageRead(NativeCoverage* coverage, std::string* error) const, (coverage, error))
+    AGENT_RUNTIME_FORWARD(CoverageStop, bool CoverageStop(std::uint64_t* covered, std::string* error) const, (covered, error))
     AGENT_RUNTIME_FORWARD(Step, bool Step(StepMode mode, bool* continued, std::string* error) const, (mode, continued, error))
     AGENT_RUNTIME_FORWARD(ReadMemory, bool ReadMemory(const MemoryAddress& address, std::size_t length, std::vector<std::uint8_t>* data, MemoryAccessError* access_error, std::string* error) const, (address, length, data, access_error, error))
     AGENT_RUNTIME_FORWARD(WriteMemory, bool WriteMemory(const MemoryAddress& address, const std::vector<std::uint8_t>& data, std::vector<std::uint8_t>* after, MemoryAccessError* access_error, std::string* error) const, (address, data, after, access_error, error))
@@ -789,6 +801,9 @@ public:
     signature override { SetUnavailable(error); return false; }
     AGENT_RUNTIME_UNAVAILABLE(GetRegisters, bool GetRegisters(RegisterSnapshot*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(SetRegisters, bool SetRegisters(const RegisterSnapshot&, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(CoverageStart, bool CoverageStart(std::uint64_t, std::uint64_t, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(CoverageRead, bool CoverageRead(NativeCoverage*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(CoverageStop, bool CoverageStop(std::uint64_t*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(Step, bool Step(StepMode, bool*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(ReadMemory, bool ReadMemory(const MemoryAddress&, std::size_t, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(WriteMemory, bool WriteMemory(const MemoryAddress&, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
@@ -1294,6 +1309,7 @@ static std::string Capabilities(const AgentConfig& config)
     JsonValue state = Object();
     Add(&state, "set_registers", JsonValue::Bool(true));
     Add(&result, "state", state);
+    Add(&result, "coverage", JsonValue::Bool(true));
     JsonValue spaces = JsonValue::Array();
     spaces.array.push_back(String("segmented"));
     spaces.array.push_back(String("linear"));
@@ -1927,6 +1943,160 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
                     Impl::Session& active = *session;
                     ++active.state_revision;
                     response = AGENT_MakeJsonRpcResult(parsed.id, SessionResult(active));
+                }
+            }
+        }
+    } else if (parsed.method == "coverage.start") {
+        std::string validation_error;
+        MemoryAddress address;
+        std::uint32_t length = 0;
+        const JsonValue* length_value = parsed.params.Find("length");
+        if (!ParseMemoryAddress(parsed.params, "coverage.start", &address, &validation_error, "start") ||
+            address.space != MemorySpace::Linear || length_value == NULL ||
+            !GetUnsignedInteger(*length_value, &length) || length == 0) {
+            response = InvalidParams(parsed.id, validation_error.empty() ?
+                                     "coverage.start requires a linear address and a positive length" : validation_error);
+        } else if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation, address, length](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    const bool success = adapter.CoverageStart(address.offset, length, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for coverage.start on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to start the coverage record" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "start", EncodeMemoryAddress(address));
+                    Add(&result, "length", Number(length));
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "coverage.read") {
+        if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    NativeCoverage coverage;
+                    const bool success = adapter.CoverageRead(&coverage, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->coverage = coverage;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for coverage.read on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to read the coverage record" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "start", Number(operation->coverage.start));
+                    Add(&result, "length", Number(operation->coverage.length));
+                    Add(&result, "covered", Number(operation->coverage.covered));
+                    Add(&result, "dropped", Number(operation->coverage.dropped));
+                    JsonValue ranges = JsonValue::Array();
+                    for (std::size_t index = 0; index < operation->coverage.ranges.size(); ++index) {
+                        JsonValue range = Object();
+                        Add(&range, "start", Number(operation->coverage.ranges[index].first));
+                        Add(&range, "end", Number(operation->coverage.ranges[index].second));
+                        ranges.array.push_back(range);
+                    }
+                    Add(&result, "ranges", ranges);
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "coverage.stop") {
+        if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            if (SubmitEmulationCommandLocked(impl, [impl, operation](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    std::uint64_t covered = 0;
+                    const bool success = adapter.CoverageStop(&covered, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->coverage.covered = covered;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for coverage.stop on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to stop the coverage record" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "covered", Number(operation->coverage.covered));
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
                 }
             }
         }

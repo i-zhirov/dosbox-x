@@ -774,6 +774,117 @@ void CDbgCondition::Describe(char *buffer,size_t length) const
 	}
 }
 
+/* The coverage record.  One bit per byte over a linear range.  The recorder
+ * runs on the emulation thread, so it needs no lock. */
+#define MAX_COVERAGE_LENGTH (64u * 1024u * 1024u)
+
+class CDbgCoverage
+{
+public:
+	static bool				Start			(uint64_t start,uint64_t length);
+	static void				Stop			(void);
+	static void				Reset			(void);
+	static void				Record			(uint64_t linear);
+	static bool				Read			(std::vector<DEBUG_AgentCoverageRange>* ranges,uint64_t* start,uint64_t* length,uint64_t* covered,uint64_t* dropped);
+	static bool				Dump			(const char *filename);
+	static bool				IsActive		(void) { return active; };
+	static uint64_t			GetCovered		(void) { return covered; };
+	static std::string		Stats			(void);
+
+private:
+	static uint64_t			start_address;
+	static uint64_t			length;
+	static std::vector<uint8_t>	bits;
+	static uint64_t			covered;
+	static uint64_t			dropped;
+	static bool				active;
+};
+
+uint64_t CDbgCoverage::start_address = 0;
+uint64_t CDbgCoverage::length = 0;
+std::vector<uint8_t> CDbgCoverage::bits;
+uint64_t CDbgCoverage::covered = 0;
+uint64_t CDbgCoverage::dropped = 0;
+bool CDbgCoverage::active = false;
+
+bool CDbgCoverage::Start(uint64_t start,uint64_t length)
+{
+	if (length == 0 || length > MAX_COVERAGE_LENGTH) return false;
+	if ((start + length) > ((uint64_t)MEM_TotalPages() << 12)) return false;
+	start_address = start;
+	CDbgCoverage::length = length;
+	bits.assign((size_t)((length + 7u) / 8u),0);
+	covered = 0;
+	dropped = 0;
+	active = true;
+	return true;
+}
+
+void CDbgCoverage::Stop(void)
+{
+	active = false;
+}
+
+void CDbgCoverage::Reset(void)
+{
+	covered = 0;
+	dropped = 0;
+	if (!bits.empty()) std::fill(bits.begin(),bits.end(),0);
+}
+
+void CDbgCoverage::Record(uint64_t linear)
+{
+	if (!active) return;
+	if (linear < start_address || linear >= (start_address + length)) { dropped++; return; }
+	const uint64_t index = linear - start_address;
+	uint8_t &byte = bits[(size_t)(index >> 3u)];
+	const uint8_t mask = (uint8_t)(1u << (index & 7u));
+	if (!(byte & mask)) { byte |= mask; covered++; }
+}
+
+bool CDbgCoverage::Read(std::vector<DEBUG_AgentCoverageRange>* ranges,uint64_t* start,uint64_t* length,uint64_t* covered,uint64_t* dropped)
+{
+	if (start != nullptr) *start = start_address;
+	if (length != nullptr) *length = CDbgCoverage::length;
+	if (covered != nullptr) *covered = CDbgCoverage::covered;
+	if (dropped != nullptr) *dropped = CDbgCoverage::dropped;
+	if (ranges != nullptr) {
+		ranges->clear();
+		uint64_t index = 0;
+		while (index < CDbgCoverage::length) {
+			if (!(bits[(size_t)(index >> 3u)] & (uint8_t)(1u << (index & 7u)))) { index++; continue; }
+			const uint64_t run_start = index;
+			while (index < CDbgCoverage::length && (bits[(size_t)(index >> 3u)] & (uint8_t)(1u << (index & 7u)))) index++;
+			DEBUG_AgentCoverageRange range;
+			range.start = start_address + run_start;
+			range.end = start_address + index - 1;
+			ranges->push_back(range);
+		}
+	}
+	return true;
+}
+
+bool CDbgCoverage::Dump(const char *filename)
+{
+	FILE *f = fopen(filename,"wt");
+	if (!f) return false;
+	std::vector<DEBUG_AgentCoverageRange> ranges;
+	Read(&ranges,nullptr,nullptr,nullptr,nullptr);
+	for (std::vector<DEBUG_AgentCoverageRange>::const_iterator it=ranges.begin(); it!=ranges.end(); ++it)
+		fprintf(f,"%08X-%08X\n",(unsigned)it->start,(unsigned)it->end);
+	fclose(f);
+	return true;
+}
+
+std::string CDbgCoverage::Stats(void)
+{
+	char buffer[128];
+	std::snprintf(buffer,sizeof(buffer),"covered %u of %u bytes (%u%%), dropped %u",
+		(unsigned)covered,(unsigned)length,
+		(unsigned)(length ? (covered * 100u / length) : 0u),(unsigned)dropped);
+	return buffer;
+}
+
 class CBreakpoint
 {
 public:
@@ -1870,6 +1981,23 @@ bool DEBUG_AgentSetRegisters(const DEBUG_AgentRegisterValues* registers)
 	SegSet16(ss,registers->ss);
 	reg_eip = registers->instruction_pointer;
 	CPU_SetFlags(registers->flags,FMASK_ALL);
+	return true;
+}
+
+bool DEBUG_AgentCoverageStart(uint64_t start, uint64_t length)
+{
+	return CDbgCoverage::Start(start,length);
+}
+
+bool DEBUG_AgentCoverageRead(std::vector<DEBUG_AgentCoverageRange>* ranges, uint64_t* start, uint64_t* length, uint64_t* covered, uint64_t* dropped)
+{
+	return CDbgCoverage::Read(ranges,start,length,covered,dropped);
+}
+
+bool DEBUG_AgentCoverageStop(uint64_t* covered)
+{
+	CDbgCoverage::Stop();
+	if (covered != nullptr) *covered = CDbgCoverage::GetCovered();
 	return true;
 }
 
@@ -3549,6 +3677,54 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "COVER") {
+		while (*found == ' ') found++;
+		if (!strncmp(found,"START",5)) {
+			found += 5;
+			DbgAddress address;
+			if (!ParseDbgAddress(found,true,address) || address.space != DBG_SPACE_LINEAR) {
+				DEBUG_ShowMsg("DEBUG: COVER START needs a linear address\n");
+				return true;
+			}
+			while (*found == ' ') found++;
+			char *next = found;
+			bool parsed = true;
+			uint32_t num = GetHexValue(found,next,&parsed);
+			if (!parsed || num == 0) {
+				DEBUG_ShowMsg("DEBUG: COVER START needs a length\n");
+				return true;
+			}
+			if (!CDbgCoverage::Start(address.offset,num)) {
+				DEBUG_ShowMsg("DEBUG: COVER START rejected the range\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: Coverage started at L:%08X for %u bytes\n",(unsigned)address.offset,(unsigned)num);
+		} else if (!strncmp(found,"STOP",4)) {
+			CDbgCoverage::Stop();
+			DEBUG_ShowMsg("DEBUG: Coverage stopped\n");
+		} else if (!strncmp(found,"RESET",5)) {
+			CDbgCoverage::Reset();
+			DEBUG_ShowMsg("DEBUG: Coverage reset\n");
+		} else if (!strncmp(found,"STATS",5)) {
+			DEBUG_ShowMsg("DEBUG: %s\n",CDbgCoverage::Stats().c_str());
+		} else if (!strncmp(found,"DUMP",4)) {
+			found += 4;
+			while (*found == ' ') found++;
+			if (!*found) {
+				DEBUG_ShowMsg("DEBUG: COVER DUMP needs a file name\n");
+				return true;
+			}
+			if (!CDbgCoverage::Dump(found)) {
+				DEBUG_ShowMsg("DEBUG: COVER DUMP failed\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: Coverage written to %s\n",found);
+		} else {
+			DEBUG_ShowMsg("DEBUG: COVER START <L:addr> <length> | STOP | RESET | STATS | DUMP <file>\n");
+		}
+		return true;
+	}
+
 #endif
 
 #if C_HEAVY_DEBUG
@@ -5086,6 +5262,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("                          - Set code breakpoint (no byte patch).\n");
 #endif
 		DEBUG_ShowMsg("PATCHB L:<addr> <byte>   - Patch a byte and restore it at the stop.\n");
+		DEBUG_ShowMsg("COVER  START <L:addr> <len> - Record the executed addresses (bitmap).\n");
+		DEBUG_ShowMsg("COVER  STOP|RESET|STATS|DUMP <file>\n");
 		DEBUG_ShowMsg("S:     selector and offset, L: linear, P: physical\n");
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
@@ -7498,6 +7676,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		skipFirstInstruction = false;
 		return false;
 	}
+	if (CDbgCoverage::IsActive()) CDbgCoverage::Record((uint64_t)SegPhys(cs)+(uint64_t)reg_eip);
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
 		debug_stop_reason = "breakpoint";
 		return true;

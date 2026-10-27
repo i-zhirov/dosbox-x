@@ -53,6 +53,18 @@ struct DEBUG_AgentRegisterValues {
 };
 
 bool DEBUG_AgentSetRegisters(const DEBUG_AgentRegisterValues* registers);
+
+// The coverage record, for the agent coverage methods.
+struct DEBUG_AgentCoverageRange {
+    uint64_t start = 0;
+    uint64_t end = 0;
+};
+
+bool DEBUG_AgentCoverageStart(uint64_t start, uint64_t length);
+bool DEBUG_AgentCoverageRead(std::vector<DEBUG_AgentCoverageRange>* ranges,
+                             uint64_t* start, uint64_t* length,
+                             uint64_t* covered, uint64_t* dropped);
+bool DEBUG_AgentCoverageStop(uint64_t* covered);
 bool DEBUG_AgentDeleteBreakpoint(uintptr_t handle);
 uintptr_t DEBUG_AgentConsumeLastBreakpoint(void);
 void DEBUG_AgentClearLastBreakpoint(void);

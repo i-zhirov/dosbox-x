@@ -772,6 +772,66 @@ bool DebuggerAdapter::StopTrace(std::size_t* event_count, std::string* error) co
 #endif
 }
 
+bool DebuggerAdapter::CoverageStart(const std::uint64_t start, const std::uint64_t length, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentCoverageStart(start, length)) {
+        if (error != NULL)
+            *error = "Debugger rejected the coverage range";
+        return false;
+    }
+    return true;
+#else
+    (void)start;
+    (void)length;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::CoverageRead(NativeCoverage* coverage, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || coverage == NULL)
+        return false;
+
+#if C_DEBUG
+    std::vector<DEBUG_AgentCoverageRange> ranges;
+    if (!DEBUG_AgentCoverageRead(&ranges, &coverage->start, &coverage->length,
+                                 &coverage->covered, &coverage->dropped)) {
+        if (error != NULL)
+            *error = "Debugger has no coverage record";
+        return false;
+    }
+    coverage->ranges.clear();
+    for (std::vector<DEBUG_AgentCoverageRange>::const_iterator it = ranges.begin(); it != ranges.end(); ++it)
+        coverage->ranges.push_back(std::make_pair(it->start, it->end));
+    return true;
+#else
+    (void)coverage;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::CoverageStop(std::uint64_t* covered, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error))
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentCoverageStop(covered)) {
+        if (error != NULL)
+            *error = "Debugger rejected the coverage stop";
+        return false;
+    }
+    return true;
+#else
+    (void)covered;
+    return false;
+#endif
+}
+
 bool DebuggerAdapter::IsTraceComplete() const
 {
 #if C_HEAVY_DEBUG

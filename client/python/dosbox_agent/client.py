@@ -408,6 +408,19 @@ class AgentClient:
                           result.get("condition") if isinstance(result.get("condition"), str) else None,
                           resolved if isinstance(resolved, Mapping) else None)
 
+    def coverage_start(self, session_id: str, start: MemoryAddress, length: int,
+                        request_id: str | None = None) -> None:
+        if length <= 0:
+            raise ValueError("length must be positive")
+        self.call("coverage.start", {"session_id": session_id, "start": start.to_rpc(), "length": length}, request_id)
+
+    def coverage_read(self, session_id: str, request_id: str | None = None) -> dict[str, Any]:
+        return self.call("coverage.read", {"session_id": session_id}, request_id)
+
+    def coverage_stop(self, session_id: str, request_id: str | None = None) -> int:
+        result = self.call("coverage.stop", {"session_id": session_id}, request_id)
+        return _integer(result, "covered")
+
     def set_registers(self, session_id: str, registers: Mapping[str, int], request_id: str | None = None) -> int:
         result = self.call("state.set_registers", {
             "session_id": session_id,

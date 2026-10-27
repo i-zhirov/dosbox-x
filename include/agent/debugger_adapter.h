@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dosbox_agent {
@@ -47,6 +48,14 @@ struct RegisterSnapshot {
     std::uint32_t instruction_pointer = 0;
     std::uint32_t flags = 0;
     std::string cpu_mode;
+};
+
+struct NativeCoverage {
+    std::uint64_t start = 0;
+    std::uint64_t length = 0;
+    std::uint64_t covered = 0;
+    std::uint64_t dropped = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t> > ranges;
 };
 
 struct TraceSample {
@@ -118,6 +127,9 @@ public:
     bool StartTrace(const std::string& detail, std::uint32_t instruction_count, std::string* error) const;
     bool ReadTrace(std::vector<TraceSample>* samples, bool* active, std::string* error) const;
     bool StopTrace(std::size_t* event_count, std::string* error) const;
+    bool CoverageStart(std::uint64_t start, std::uint64_t length, std::string* error) const;
+    bool CoverageRead(NativeCoverage* coverage, std::string* error) const;
+    bool CoverageStop(std::uint64_t* covered, std::string* error) const;
     bool IsTraceComplete() const;
     bool TerminateTarget(std::string* error) const;
 };
