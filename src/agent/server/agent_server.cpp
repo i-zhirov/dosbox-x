@@ -524,6 +524,7 @@ static bool IsKnownMethod(const std::string& method)
            method == "coverage.start" ||
            method == "coverage.read" ||
            method == "coverage.stop" ||
+           method == "screen.capture" ||
            method == "input.key" ||
            method == "input.mouse" ||
            method == "fileio.start" ||
@@ -586,6 +587,8 @@ public:
         bool fileio_has_next = false;
         std::uint64_t fileio_next_cursor = 0;
         std::uint32_t input_count = 0;
+        std::uint32_t screen_rows = 0;
+        std::uint32_t screen_columns = 0;
     };
 
     struct AdapterOperation {
@@ -608,6 +611,8 @@ public:
         bool fileio_has_next = false;
         std::uint64_t fileio_next_cursor = 0;
         std::uint32_t input_count = 0;
+        std::uint32_t screen_rows = 0;
+        std::uint32_t screen_columns = 0;
     };
 
     struct StepOperation {
@@ -712,6 +717,8 @@ public:
     virtual bool InputMouseMove(int x, int y, std::string* error) const = 0;
     virtual bool InputMouseButton(std::uint8_t button, bool down, std::string* error) const = 0;
     virtual bool InputMouseClick(std::uint8_t button, std::string* error) const = 0;
+    virtual bool ScreenText(const std::string& path, std::uint32_t* rows, std::uint32_t* columns, std::string* error) const = 0;
+    virtual bool ScreenImage(const std::string& path, std::string* error) const = 0;
     virtual bool Step(StepMode mode, bool* continued, std::string* error) const = 0;
     virtual bool ReadMemory(const MemoryAddress& address,
                             std::size_t length,
@@ -782,6 +789,8 @@ public:
     AGENT_RUNTIME_FORWARD(InputMouseMove, bool InputMouseMove(int x, int y, std::string* error) const, (x, y, error))
     AGENT_RUNTIME_FORWARD(InputMouseButton, bool InputMouseButton(std::uint8_t button, bool down, std::string* error) const, (button, down, error))
     AGENT_RUNTIME_FORWARD(InputMouseClick, bool InputMouseClick(std::uint8_t button, std::string* error) const, (button, error))
+    AGENT_RUNTIME_FORWARD(ScreenText, bool ScreenText(const std::string& path, std::uint32_t* rows, std::uint32_t* columns, std::string* error) const, (path, rows, columns, error))
+    AGENT_RUNTIME_FORWARD(ScreenImage, bool ScreenImage(const std::string& path, std::string* error) const, (path, error))
     AGENT_RUNTIME_FORWARD(Step, bool Step(StepMode mode, bool* continued, std::string* error) const, (mode, continued, error))
     AGENT_RUNTIME_FORWARD(ReadMemory, bool ReadMemory(const MemoryAddress& address, std::size_t length, std::vector<std::uint8_t>* data, MemoryAccessError* access_error, std::string* error) const, (address, length, data, access_error, error))
     AGENT_RUNTIME_FORWARD(WriteMemory, bool WriteMemory(const MemoryAddress& address, const std::vector<std::uint8_t>& data, std::vector<std::uint8_t>* after, MemoryAccessError* access_error, std::string* error) const, (address, data, after, access_error, error))
@@ -849,6 +858,8 @@ public:
     AGENT_RUNTIME_UNAVAILABLE(InputMouseMove, bool InputMouseMove(int, int, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(InputMouseButton, bool InputMouseButton(std::uint8_t, bool, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(InputMouseClick, bool InputMouseClick(std::uint8_t, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(ScreenText, bool ScreenText(const std::string&, std::uint32_t*, std::uint32_t*, std::string* error) const)
+    AGENT_RUNTIME_UNAVAILABLE(ScreenImage, bool ScreenImage(const std::string&, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(Step, bool Step(StepMode, bool*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(ReadMemory, bool ReadMemory(const MemoryAddress&, std::size_t, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
     AGENT_RUNTIME_UNAVAILABLE(WriteMemory, bool WriteMemory(const MemoryAddress&, const std::vector<std::uint8_t>&, std::vector<std::uint8_t>*, MemoryAccessError*, std::string* error) const)
@@ -1358,6 +1369,7 @@ static std::string Capabilities(const AgentConfig& config)
     Add(&result, "fileio", JsonValue::Bool(true));
     Add(&result, "input.key", JsonValue::Bool(true));
     Add(&result, "input.mouse", JsonValue::Bool(true));
+    Add(&result, "screen", JsonValue::Bool(true));
     JsonValue spaces = JsonValue::Array();
     spaces.array.push_back(String("segmented"));
     spaces.array.push_back(String("linear"));
@@ -2144,6 +2156,67 @@ std::string AgentServer::HandleJsonRpcImpl(const std::shared_ptr<Impl>& impl, co
                 } else {
                     JsonValue result = SessionResult(*session);
                     Add(&result, "covered", Number(operation->coverage.covered));
+                    response = AGENT_MakeJsonRpcResult(parsed.id, result);
+                }
+            }
+        }
+    } else if (parsed.method == "screen.capture") {
+        std::string mode;
+        std::string path;
+        if (!GetString(parsed.params, "mode", &mode) || (mode != "text" && mode != "image")) {
+            response = InvalidParams(parsed.id, "screen.capture mode must be text or image");
+        } else if (!GetString(parsed.params, "path", &path) || path.empty()) {
+            response = InvalidParams(parsed.id, "screen.capture requires a path");
+        } else if (session->state == Impl::SessionState::Exited) {
+            response = SessionError(parsed.id, kErrorCapabilityUnavailable, "Target has exited", "TARGET_EXITED", session);
+        } else {
+            const std::shared_ptr<Impl::AdapterOperation> operation(new Impl::AdapterOperation());
+            const std::string session_id = session->id;
+            const bool text = mode == "text";
+            if (SubmitEmulationCommandLocked(impl, [impl, operation, text, path](const std::uint64_t) {
+                    AgentRuntime& adapter = *impl->runtime;
+                    std::string adapter_error;
+                    std::uint32_t rows = 0;
+                    std::uint32_t columns = 0;
+                    const bool success = text ?
+                        adapter.ScreenText(path, &rows, &columns, &adapter_error) :
+                        adapter.ScreenImage(path, &adapter_error);
+                    {
+                        std::lock_guard<std::mutex> operation_lock(operation->mutex);
+                        operation->success = success;
+                        operation->error = adapter_error;
+                        operation->screen_rows = rows;
+                        operation->screen_columns = columns;
+                        operation->done = true;
+                    }
+                    operation->completed.notify_all();
+                }) == 0) {
+                response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                 "Emulation-thread bridge is unavailable", "COMMAND_REJECTED");
+            } else {
+                std::unique_lock<std::mutex> operation_lock(operation->mutex);
+                lock.unlock();
+                const bool completed = operation->completed.wait_for(operation_lock,
+                        std::chrono::milliseconds(impl->config.request_timeout_ms),
+                        [operation]() { return operation->done; });
+                lock.lock();
+                if (!RebindSessionAfterWait(impl, session_id, &session, &response, parsed.id))
+                    return response;
+                if (!completed) {
+                    response = Error(parsed.id, kErrorOperationTimeout,
+                                     "Timed out waiting for screen.capture on the emulation thread", "OPERATION_TIMEOUT");
+                } else if (!operation->success) {
+                    response = Error(parsed.id, kErrorCapabilityUnavailable,
+                                     operation->error.empty() ? "Unable to capture the screen" : operation->error,
+                                     "COMMAND_REJECTED");
+                } else {
+                    JsonValue result = SessionResult(*session);
+                    Add(&result, "mode", String(mode));
+                    Add(&result, "path", String(path));
+                    if (text) {
+                        Add(&result, "rows", Number(operation->screen_rows));
+                        Add(&result, "columns", Number(operation->screen_columns));
+                    }
                     response = AGENT_MakeJsonRpcResult(parsed.id, result);
                 }
             }

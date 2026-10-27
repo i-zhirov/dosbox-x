@@ -1020,6 +1020,43 @@ bool DebuggerAdapter::InputMouseClick(const std::uint8_t button, std::string* er
 #endif
 }
 
+bool DebuggerAdapter::ScreenText(const std::string& path, std::uint32_t* rows,
+                                  std::uint32_t* columns, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || path.empty())
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentScreenText(path.c_str(), rows, columns)) {
+        if (error != NULL)
+            *error = "Debugger could not write the text screen";
+        return false;
+    }
+    return true;
+#else
+    (void)rows;
+    (void)columns;
+    return false;
+#endif
+}
+
+bool DebuggerAdapter::ScreenImage(const std::string& path, std::string* error) const
+{
+    if (!RequireAvailable(error) || !RequireEmulationThread(error) || path.empty())
+        return false;
+
+#if C_DEBUG
+    if (!DEBUG_AgentScreenImage(path.c_str())) {
+        if (error != NULL)
+            *error = "Debugger could not schedule the image capture";
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool DebuggerAdapter::IsTraceComplete() const
 {
 #if C_HEAVY_DEBUG

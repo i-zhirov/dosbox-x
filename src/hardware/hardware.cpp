@@ -572,7 +572,19 @@ std::string GetCaptureFilePath(const char * type,const char * ext) {
 	return file_name;
 }
 
+static std::string capture_file_override;
+
+void CAPTURE_SetFileOverride(const char* path) {
+	capture_file_override = path != NULL ? path : "";
+}
+
 FILE * OpenCaptureFile(const char * type,const char * ext) {
+	if (!capture_file_override.empty()) {
+		FILE * fp = fopen(capture_file_override.c_str(),"wb");
+		capture_file_override.clear();
+		return fp;
+	}
+
     if (!strcmp(type, "Raw Midi")) pathmid = "";
     if (!strcmp(type, "Raw Opl")) pathopl = "";
     if (!strcmp(type, "Screenshot")) pathscr = "";

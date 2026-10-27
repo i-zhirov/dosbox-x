@@ -40,6 +40,8 @@ using namespace std;
 #include "logging.h"
 #include "bios.h"
 #include "mouse.h"
+#include "mem.h"
+#include "hardware.h"
 #include "timer.h"
 #include "video.h"
 #include "vga.h"
@@ -2278,6 +2280,43 @@ bool DEBUG_AgentMouseClick(uint8_t button)
 	return true;
 }
 
+bool DEBUG_AgentScreenText(const char* filename,uint32_t* rows,uint32_t* columns)
+{
+	if (filename == NULL) return false;
+	FILE* file = fopen(filename,"wb");
+	if (file == NULL) return false;
+	/* The color text mode holds 80 columns by 25 rows of words at B800:0.
+	 * The low byte holds the character and the high byte the attribute. */
+	for (unsigned int row=0; row<25; row++) {
+		char line[81];
+		for (unsigned int column=0; column<80; column++) {
+			const uint16_t cell = real_readw(0xb800,(uint16_t)((row*80+column)*2));
+			const unsigned char c = (unsigned char)(cell & 0xff);
+			line[column] = (c >= 0x20 && c < 0x7f) ? (char)c : ' ';
+		}
+		line[80] = 0;
+		fprintf(file,"%s\n",line);
+	}
+	fclose(file);
+	if (rows != NULL) *rows = 25;
+	if (columns != NULL) *columns = 80;
+	return true;
+}
+
+bool DEBUG_AgentScreenImage(const char* filename)
+{
+	if (filename == NULL) return false;
+#if (C_SSHOT)
+	/* The rendered frame path writes the PNG at the next frame through the
+	 * capture file name override. */
+	CAPTURE_SetFileOverride(filename);
+	CaptureState |= CAPTURE_IMAGE;
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool DEBUG_AgentCoverageStart(uint64_t start, uint64_t length)
 {
 	return CDbgCoverage::Start(start,length);
@@ -4078,6 +4117,39 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg("DEBUG: mouse injection stopped\n");
 		} else {
 			DEBUG_ShowMsg("DEBUG: MOUSE MOVE <x> <y> | BUTTON <n> DOWN|UP | CLICK <n> | STOP\n");
+		}
+		return true;
+	}
+
+	if (command == "SCREEN") {
+		while (*found == ' ') found++;
+		if (!strncmp(found,"TEXT",4)) {
+			found += 4;
+			while (*found == ' ') found++;
+			if (!*found) {
+				DEBUG_ShowMsg("DEBUG: SCREEN TEXT needs a file name\n");
+				return true;
+			}
+			uint32_t rows = 0, columns = 0;
+			if (!DEBUG_AgentScreenText(found,&rows,&columns)) {
+				DEBUG_ShowMsg("DEBUG: SCREEN TEXT failed\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: SCREEN TEXT wrote %u row(s) of %u column(s)\n",rows,columns);
+		} else if (!strncmp(found,"IMAGE",5)) {
+			found += 5;
+			while (*found == ' ') found++;
+			if (!*found) {
+				DEBUG_ShowMsg("DEBUG: SCREEN IMAGE needs a file name\n");
+				return true;
+			}
+			if (!DEBUG_AgentScreenImage(found)) {
+				DEBUG_ShowMsg("DEBUG: SCREEN IMAGE failed\n");
+				return true;
+			}
+			DEBUG_ShowMsg("DEBUG: SCREEN IMAGE scheduled: %s\n",found);
+		} else {
+			DEBUG_ShowMsg("DEBUG: SCREEN TEXT <file> | IMAGE <file>\n");
 		}
 		return true;
 	}

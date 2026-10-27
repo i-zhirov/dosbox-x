@@ -152,6 +152,8 @@ public:
     bool InputMouseButton(std::uint8_t button, bool down, std::string* error) const;
     bool InputMouseClick(std::uint8_t button, std::string* error) const;
     bool IsTraceComplete() const;
+    bool ScreenText(const std::string& path, std::uint32_t* rows, std::uint32_t* columns, std::string* error) const;
+    bool ScreenImage(const std::string& path, std::string* error) const;
     bool TerminateTarget(std::string* error) const;
 };
 

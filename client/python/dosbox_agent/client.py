@@ -408,6 +408,12 @@ class AgentClient:
                           result.get("condition") if isinstance(result.get("condition"), str) else None,
                           resolved if isinstance(resolved, Mapping) else None)
 
+    def screen_capture(self, session_id: str, mode: str, path: str | Path,
+                        request_id: str | None = None) -> dict[str, Any]:
+        if mode not in ("text", "image"):
+            raise ValueError("mode must be text or image")
+        return self.call("screen.capture", {"session_id": session_id, "mode": mode, "path": str(path)}, request_id)
+
     def input_key(self, session_id: str, *, text: str | None = None, scan: int | None = None,
                   script: str | Path | None = None, stop: bool = False,
                   request_id: str | None = None) -> dict[str, Any]:

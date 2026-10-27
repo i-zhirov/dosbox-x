@@ -89,6 +89,8 @@ bool DEBUG_AgentInputStop();
 bool DEBUG_AgentMouseMove(int x,int y);
 bool DEBUG_AgentMouseButton(uint8_t button,bool down);
 bool DEBUG_AgentMouseClick(uint8_t button);
+bool DEBUG_AgentScreenText(const char* filename,uint32_t* rows,uint32_t* columns);
+bool DEBUG_AgentScreenImage(const char* filename);
 void DEBUG_InputRunTimers();
 
 // The file-I/O record used by the DOS file calls.

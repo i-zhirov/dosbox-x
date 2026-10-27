@@ -52,6 +52,7 @@ void CAPTURE_AddWave(uint32_t freq, uint32_t len, int16_t * data);
 #define CAPTURE_FLAG_DBLW	0x1
 #define CAPTURE_FLAG_DBLH	0x2
 #define CAPTURE_FLAG_NOCHANGE   0x4
+void CAPTURE_SetFileOverride(const char* path);
 void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags, float fps, uint8_t * data, uint8_t * pal);
 void CAPTURE_AddMidi(bool sysex, Bitu len, uint8_t * data);
 void CAPTURE_VideoStart();
