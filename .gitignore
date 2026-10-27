@@ -144,3 +144,6 @@ contrib/macos/dosbox-x.plist
 
 # Test work directories.
 work/
+
+# Python bytecode cache.
+__pycache__/
