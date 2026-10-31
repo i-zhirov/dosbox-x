@@ -5182,6 +5182,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("Some demos or games mistakenly use INT 15h AH=0x86 (WAIT) while leaving the IRQs needed for it masked.\n"
             "If this option is set (by default), the necessary IRQs will be unmasked when INT 15 AH=0x86 is used so that the game or demo does not hang.");
 
+    Pbool = secprop->Add_bool("dos4gw_api",Property::Changeable::OnlyAtStart,true);
+    Pbool->Set_help("Answer the DOS/4GW INT 15h AX=BFDE services. A real DOS extender answers the call; disable to keep the unknown call behavior.");
+
     Pbool = secprop->Add_bool("int15 mouse callback does not preserve registers",Property::Changeable::OnlyAtStart,false);
     Pbool->Set_help("Set to true if the guest OS or DOS program assigns an INT 15h mouse callback,\n"
             "but does not properly preserve CPU registers. Diagnostic function only (default off).");

@@ -176,7 +176,7 @@ int enablelfn=-1;
 int fat32setver=-1;
 bool uselfn, winautorun=false;
 extern int infix, log_dev_con;
-extern bool int15_wait_force_unmask_irq, shellrun, logging_con, ctrlbrk;
+extern bool int15_wait_force_unmask_irq, dos4gw_api, shellrun, logging_con, ctrlbrk;
 extern bool winrun, startcmd, startwait, startquiet, starttranspath, i4dos;
 extern bool startup_state_numlock, mountwarning, clipboard_dosapi;
 std::string startincon;
@@ -4354,6 +4354,7 @@ public:
 		ENV_KEEPFREE = (unsigned int)section->Get_int("additional environment block size on exec");
 		enable_dummy_device_mcb = section->Get_bool("enable dummy device mcb");
 		int15_wait_force_unmask_irq = section->Get_bool("int15 wait force unmask irq");
+		dos4gw_api = section->Get_bool("dos4gw_api");
 		disk_io_unmask_irq0 = section->Get_bool("unmask timer on disk io");
 		mountwarning = section->Get_bool("mountwarning");
 		if (winrun) {

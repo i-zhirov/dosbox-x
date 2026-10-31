@@ -188,6 +188,7 @@ bool bochs_port_e9 = false;
 bool isa_memory_hole_512kb = false;
 bool isa_memory_hole_15mb = false;
 bool int15_wait_force_unmask_irq = false;
+bool dos4gw_api = true;
 
 int unhandled_irq_method = UNHANDLED_IRQ_SIMPLE;
 
@@ -6876,6 +6877,29 @@ unsigned char KEYBOARD_AUX_SampleRate();
 void KEYBOARD_ClrBuffer(void);
 void KEYBOARD_AUX_LowerIRQ();
 
+/* Answer the two DOS/4GW INT 15h AX=BFDEh services that the OpenWatcom
+ * run-time calls at its startup.  Return whether the call is answered. */
+static bool INT15_Dos4gwApi(void) {
+    switch (reg_bx) {
+        case 0x000A:
+            reg_ax = 0x0000;
+            CALLBACK_SCF(false);
+            return true;
+        case 0x0015:
+            if (reg_cx != 0x0005) return false;
+            /* The caller checks the word at ES:000Ah and the word at ES:000Ch
+             * against its CS.  The caller's CS sits at SS:SP+2 in the
+             * interrupt frame. */
+            real_writew(SegValue(es),0x000A,0x0010);
+            real_writew(SegValue(es),0x000C,real_readw(SegValue(ss),(uint16_t)(reg_sp + 2)));
+            reg_ax = 0x0000;
+            CALLBACK_SCF(false);
+            return true;
+        default:
+            return false;
+    }
+}
+
 static Bitu INT15_Handler(void) {
     if( ( machine==MCH_AMSTRAD ) && ( reg_ah<0x07 ) ) {
         switch(reg_ah) {
@@ -7898,6 +7922,10 @@ static Bitu INT15_Handler(void) {
             CALLBACK_SCF(true);
         }
         break;
+    case 0xBF:
+        if (dos4gw_api && (reg_al == 0xDE) && INT15_Dos4gwApi())
+            break;
+        /* fall through to the unknown call */
     default:
         LOG(LOG_BIOS,LOG_ERROR)("INT15:Unknown call ax=%4X",reg_ax);
         reg_ah=0x86;
