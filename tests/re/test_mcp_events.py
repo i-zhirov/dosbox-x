@@ -61,6 +61,22 @@ class StopEventTests(unittest.TestCase):
         self.assertEqual(fields[3], "0")
         self.assertEqual(fields[4], "1")
 
+    def test_selector_entry_breakpoint(self) -> None:
+        """S:<selector>:* stops at the first instruction in the selector."""
+        self.assertTrue(self.client.request(
+            "EXEC", f"BPX S:{ENTRY_SELECTOR}:*").ok)
+        self.assertTrue(self.client.request("EXEC", "RUN").ok)
+        event = self.client.read_until(
+            lambda frame: frame.identifier == "event" and any(
+                line.startswith("STOP breakpoint") for line in frame.lines),
+            120)
+        self.assertIsNotNone(event, "no breakpoint event")
+        state = self.client.request("EXEC", "EV CS EIP")
+        self.assertTrue(state.ok)
+        fields = state.lines[-1].split()
+        self.assertEqual(fields[0].upper(), ENTRY_SELECTOR.upper())
+        self.assertEqual(fields[1].upper(), ENTRY_EIP.upper())
+
     def test_condition_event(self) -> None:
         """A conditional hit delivers the condition result 1."""
         self.assertTrue(self.client.request(

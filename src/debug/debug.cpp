@@ -665,7 +665,7 @@ static void AnnotateDirectBranch(char* line, const size_t line_size)
 bool mustCompleteInstruction = false;
 bool skipFirstInstruction = false;
 
-enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_CODE_LINEAR, BKPNT_CODE_SELECTOR, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
+enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_CODE_LINEAR, BKPNT_CODE_SELECTOR, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE, BKPNT_CODE_SELECTOR_ANY };
 
 #define BPINT_ALL 0x100
 
@@ -675,8 +675,9 @@ struct DbgAddress {
 	EDbgAddressSpace	space;
 	uint16_t			selector;
 	uint32_t			offset;
+	bool				any_offset;
 
-	DbgAddress(void) : space(DBG_SPACE_SEGMENTED), selector(0), offset(0) { }
+	DbgAddress(void) : space(DBG_SPACE_SEGMENTED), selector(0), offset(0), any_offset(false) { }
 };
 
 /* An address as the resolver reports it.  The command prints the record at set
@@ -1013,6 +1014,7 @@ public:
 	void					SetOther		(uint8_t other)				{ alValue = other; };	
 	void					SetLinearAddress	(uint32_t linear)			{ location = (PhysPt)linear; offset = linear; segment = 0; type = BKPNT_CODE_LINEAR; };
 	void					SetSelectorAddress	(uint16_t sel, uint32_t off)	{ location = (PhysPt)GetAddress(sel,off); segment = sel; offset = off; type = BKPNT_CODE_SELECTOR; };
+	void					SetSelectorAnyAddress	(uint16_t sel)			{ location = 0; segment = sel; offset = 0; type = BKPNT_CODE_SELECTOR_ANY; };
 	void					SetCondition		(const CDbgCondition &_condition)	{ condition = _condition; };
 	void					SetHitLimit			(uint32_t limit)			{ hitLimit = limit; };
 
@@ -1039,6 +1041,7 @@ public:
 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
 	static CBreakpoint*		AddCodeBreakpoint	(uint32_t linear, bool once);
 	static CBreakpoint*		AddSelectorBreakpoint(uint16_t sel, uint32_t off, bool once);
+	static CBreakpoint*		AddSelectorAnyBreakpoint(uint16_t sel, bool once);
 	static void				DeactivateBreakpoints();
 	static void				ActivateBreakpoints	();
 	static void				ActivateBreakpointsExceptAt(PhysPt adr);
@@ -1290,6 +1293,15 @@ CBreakpoint* CBreakpoint::AddSelectorBreakpoint(uint16_t sel, uint32_t off, bool
 	return bp;
 }
 
+CBreakpoint* CBreakpoint::AddSelectorAnyBreakpoint(uint16_t sel, bool once)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetSelectorAnyAddress	(sel);
+	bp->SetOnce			(once);
+	BPoints.push_front		(bp);
+	return bp;
+}
+
 void CBreakpoint::ActivateBreakpoints()
 {
 	// activate all breakpoints
@@ -1335,6 +1347,15 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 				atAddress = (bp->GetLocation() == GetAddress(seg, off));
 			else if (bp->GetType() == BKPNT_CODE_SELECTOR)
 				atAddress = (bp->GetSegment() == seg) && (bp->GetOffset() == off);
+			else if (bp->GetType() == BKPNT_CODE_SELECTOR_ANY) {
+				/* A selector-entry breakpoint matches the first instruction in
+				 * the selector.  Real mode and V86 mode use segments, not
+				 * selectors, so the match needs the protected mode. */
+				atAddress = cpu.pmode && !(reg_flags & FLAG_VM) &&
+					(bp->GetSegment() == seg);
+				/* Report the hit at the instruction that matched. */
+				if (atAddress) bp->location = (PhysPt)GetAddress(seg, off);
+			}
 		}
 
 		if (atAddress) {
@@ -1592,6 +1613,10 @@ void CBreakpoint::ShowList(void)
 			char cond[128];
 			bp->GetCondition().Describe(cond,sizeof(cond));
 			DEBUG_ShowMsg("%02X. BPX %04X:%08X (linear %08X, physical %08X)%s%s (hits %u)\n",nr,bp->GetSegment(),bp->GetOffset(),(unsigned)resolved.linear,(unsigned)resolved.physical,*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
+		} else if (bp->GetType()==BKPNT_CODE_SELECTOR_ANY) {
+			char cond[128];
+			bp->GetCondition().Describe(cond,sizeof(cond));
+			DEBUG_ShowMsg("%02X. BPX %04X:* (selector entry, last linear %08X)%s%s (hits %u)\n",nr,bp->GetSegment(),(unsigned)bp->GetLocation(),*cond ? " IF " : "",cond,(unsigned)bp->GetHitCount());
 		} else if (bp->GetType()==BKPNT_MEMORY_LINEAR ) {
 			DEBUG_ShowMsg("%02X. BPLM %08X (physical %08X) (%02X)\n",nr,bp->GetOffset(),(unsigned)resolved.physical,bp->GetValue());
         } else if (bp->GetType()==BKPNT_MEMORY_FREEZE ) {
@@ -1627,6 +1652,14 @@ static bool ParseDbgAddress(char *&p,bool bare_is_linear,DbgAddress &address)
 		if (*next != ':') return false;
 		next++;
 		address.selector = (uint16_t)selector;
+		/* An asterisk instead of an offset selects every offset in the
+		 * selector, so the first instruction in it stops the guest. */
+		if (*next == '*') {
+			address.any_offset = true;
+			address.offset = 0;
+			p = next + 1;
+			return true;
+		}
 		char *next2 = next;
 		address.offset = GetHexValue(next,next2,&parsed);
 		if (!parsed) return false;
@@ -4110,21 +4143,28 @@ bool ParseCommand(char* str) {
 		uint32_t hitLimit = 0;
 		bool once = false;
 		if (!ParseBreakpointOptions(found,condition,hitLimit,once)) return true;
-		DbgResolved resolved = ResolveDbgAddress(address);
-		if (!resolved.valid) {
-			DEBUG_ShowMsg("DEBUG: BPX: %s\n",resolved.error);
-			return true;
-		}
 		CBreakpoint *bp = nullptr;
-		if (address.space == DBG_SPACE_LINEAR) {
-			bp = CBreakpoint::AddCodeBreakpoint(address.offset,once);
-			DEBUG_ShowMsg("DEBUG: Set linear code breakpoint at L:%08X (physical %08X)%s\n",address.offset,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
-		} else if (address.space == DBG_SPACE_SEGMENTED) {
-			bp = CBreakpoint::AddSelectorBreakpoint(address.selector,address.offset,once);
-			DEBUG_ShowMsg("DEBUG: Set selector code breakpoint at %04X:%08X (linear %08X, physical %08X)%s\n",address.selector,address.offset,(uint32_t)resolved.linear,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+		if (address.any_offset && address.space == DBG_SPACE_SEGMENTED) {
+			/* No resolution at set time: the selector may not be loaded yet,
+			 * and the breakpoint matches the first instruction in it. */
+			bp = CBreakpoint::AddSelectorAnyBreakpoint(address.selector,once);
+			DEBUG_ShowMsg("DEBUG: Set selector-entry code breakpoint at %04X:* (the first instruction in the selector)\n",address.selector);
 		} else {
-			DEBUG_ShowMsg("DEBUG: BPX takes a linear or a selector address\n");
-			return true;
+			DbgResolved resolved = ResolveDbgAddress(address);
+			if (!resolved.valid) {
+				DEBUG_ShowMsg("DEBUG: BPX: %s\n",resolved.error);
+				return true;
+			}
+			if (address.space == DBG_SPACE_LINEAR) {
+				bp = CBreakpoint::AddCodeBreakpoint(address.offset,once);
+				DEBUG_ShowMsg("DEBUG: Set linear code breakpoint at L:%08X (physical %08X)%s\n",address.offset,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+			} else if (address.space == DBG_SPACE_SEGMENTED) {
+				bp = CBreakpoint::AddSelectorBreakpoint(address.selector,address.offset,once);
+				DEBUG_ShowMsg("DEBUG: Set selector code breakpoint at %04X:%08X (linear %08X, physical %08X)%s\n",address.selector,address.offset,(uint32_t)resolved.linear,(uint32_t)resolved.physical,resolved.masked ? " [the offset wrapped to 16 bits]" : "");
+			} else {
+				DEBUG_ShowMsg("DEBUG: BPX takes a linear or a selector address\n");
+				return true;
+			}
 		}
 		if (bp) {
 			bp->SetCondition(condition);
@@ -5884,6 +5924,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("BPLM   [linear address]   - Set linear memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPX    [L:|S:]address [IF reg op value] [HIT n] [ONCE]\n");
 		DEBUG_ShowMsg("                          - Set code breakpoint (no byte patch).\n");
+		DEBUG_ShowMsg("BPX    S:<selector>:*     - Set a selector-entry code breakpoint.\n");
+		DEBUG_ShowMsg("                          - Stop at the first instruction in the selector.\n");
 #endif
 		DEBUG_ShowMsg("PATCHB L:<addr> <byte>   - Patch a byte and restore it at the stop.\n");
 		DEBUG_ShowMsg("COVER  START <L:addr> <len> - Record the executed addresses (bitmap).\n");
