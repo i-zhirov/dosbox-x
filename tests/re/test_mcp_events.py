@@ -74,8 +74,8 @@ class StopEventTests(unittest.TestCase):
         state = self.client.request("EXEC", "EV CS EIP")
         self.assertTrue(state.ok)
         fields = state.lines[-1].split()
-        self.assertEqual(fields[0].upper(), ENTRY_SELECTOR.upper())
-        self.assertEqual(fields[1].upper(), ENTRY_EIP.upper())
+        self.assertEqual(int(fields[0], 16), int(ENTRY_SELECTOR, 16))
+        self.assertEqual(int(fields[1], 16), int(ENTRY_EIP, 16))
 
     def test_condition_event(self) -> None:
         """A conditional hit delivers the condition result 1."""
